@@ -30,6 +30,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -101,7 +102,61 @@ typedef struct {
     /* Current filter settings, kept lowercased for cheap comparison. */
     char search_text[NAME_LEN];
     int  type_filter;                /* TYPE_NONE means "all types" */
+
+    /* --- Duel tab --- */
+    GtkWidget    *duel_entry[2];
+    GtkWidget    *duel_sprite[2];
+    GtkWidget    *duel_name[2];
+    GtkWidget    *duel_types[2];
+    GtkWidget    *duel_moves[2];
+    GtkWidget    *duel_stat[2][6];   /* one label per stat, per side */
+    GtkWidget    *duel_stat_bar[2][6];
+    GtkWidget    *duel_total[2];
+    GtkWidget    *duel_runs;
+    GtkWidget    *duel_result;
+    GtkWidget    *duel_detail;
+    GtkWidget    *duel_bar;
+
+    /* --- Ranking tab --- */
+    GtkWidget    *rank_button;
+    GtkWidget    *rank_runs;
+    GtkWidget    *rank_progress;
+    GtkWidget    *rank_status;
+    GtkWidget    *rank_search;
+    GtkWidget    *rank_type_combo;
+    GtkListStore *rank_store;
+    GtkTreeModel *rank_filter;
+    GtkWidget    *rank_tree;
+    char          rank_search_text[NAME_LEN];
+    int           rank_type_filter;
+
+    /* Worker state. `running` is read by the GUI thread and written by it
+     * too; the worker only ever touches `progress` and `cancel`. */
+    GThread      *worker;
+    volatile int  cancel;
+    volatile int  worker_done;
+    double        progress;
+    int           worker_runs;
+    double        worker_seconds;
+    RankEntry    *results;
 } AppState;
+
+/* Columns of the ranking table. */
+enum {
+    RK_RANK, RK_ICON, RK_NAME, RK_TYPE1, RK_TYPE2,
+    RK_WINS, RK_LOSSES, RK_DRAWS, RK_WINPCT, RK_TOTAL,
+    RK_AVGTURNS, RK_DMGRATIO, RK_INDEX, RK_N
+};
+
+/*
+ * The Duel and Ranking pages are built further down, after the widgets they
+ * rely on, but activate() needs to know about them up here.
+ */
+static GtkWidget *build_duel_page(AppState *state);
+static GtkWidget *build_rank_page(AppState *state);
+static void       duel_refresh(AppState *state);
+static void       on_duel_run(GtkButton *button, gpointer data);
+static void       on_rank_run(GtkButton *button, gpointer data);
 
 static void get_stats(const Pokemon *p, int out[6])
 {
@@ -220,7 +275,11 @@ static void load_css(void)
         "treeview header button { background-color: #2f3640; color: #9aa4b2;\n"
         "                         border: 0; padding: 4px; }\n"
         "scrollbar { background-color: #262b33; }\n"
-        "separator { background-color: #39404a; }\n";
+        "separator { background-color: #39404a; }\n"
+        /* The percentage sits on top of the filled bar, so it needs a colour
+         * that reads against both the filled and unfilled halves. */
+        "progressbar text { color: #e6e6e6; font-size: 11px; }\n"
+        "spinbutton { background-color: #2b313a; color: #e6e6e6; }\n";
 
     GtkCssProvider *provider = gtk_css_provider_new();
     gtk_css_provider_load_from_data(provider, css, -1, NULL);
@@ -543,6 +602,58 @@ static void add_column(GtkWidget *tree, const char *title, int column,
 static void add_number_column(GtkWidget *tree, const char *title, int column)
 {
     add_column(tree, title, column, 62, TRUE);
+}
+
+/*
+ * A double stored in the model renders as its full precision -- 95.676491 --
+ * which is unreadable in a table. Binding a cell data function instead lets
+ * the column keep the real number for sorting while showing a rounded one.
+ * The suffix ("%" or nothing) rides along in the user data.
+ */
+static void format_decimal(GtkTreeViewColumn *col, GtkCellRenderer *cell,
+                           GtkTreeModel *model, GtkTreeIter *iter,
+                           gpointer data)
+{
+    (void)col;
+    int column = GPOINTER_TO_INT(data);
+    int percent = column < 0;
+    if (percent) {
+        column = -column - 1;
+    }
+
+    double value = 0.0;
+    gtk_tree_model_get(model, iter, column, &value, -1);
+
+    char text[32];
+    snprintf(text, sizeof text, percent ? "%.1f%%" : "%.2f", value);
+    g_object_set(cell, "text", text, NULL);
+}
+
+static void add_formatted_column(GtkWidget *tree, const char *title,
+                                 int column, int percent)
+{
+    GtkCellRenderer *renderer = gtk_cell_renderer_text_new();
+    g_object_set(renderer, "xalign", 1.0, NULL);
+    GtkTreeViewColumn *col = gtk_tree_view_column_new_with_attributes(
+        title, renderer, NULL);
+    gtk_tree_view_column_set_sizing(col, GTK_TREE_VIEW_COLUMN_FIXED);
+    gtk_tree_view_column_set_fixed_width(col, 70);
+    gtk_tree_view_column_set_sort_column_id(col, column);
+    gtk_tree_view_column_set_resizable(col, TRUE);
+    gtk_tree_view_column_set_cell_data_func(
+        col, renderer, format_decimal,
+        GINT_TO_POINTER(percent ? -(column + 1) : column), NULL);
+    gtk_tree_view_append_column(GTK_TREE_VIEW(tree), col);
+}
+
+static void add_decimal_column(GtkWidget *tree, const char *title, int column)
+{
+    add_formatted_column(tree, title, column, 0);
+}
+
+static void add_percent_column(GtkWidget *tree, const char *title, int column)
+{
+    add_formatted_column(tree, title, column, 1);
 }
 
 /* The sprite column: no title, no sorting, just the icon. */
@@ -875,6 +986,10 @@ static void activate(GtkApplication *app, gpointer data)
     GtkWidget *notebook = gtk_notebook_new();
     gtk_notebook_append_page(GTK_NOTEBOOK(notebook), build_dex_page(state),
                              gtk_label_new("Pokedex"));
+    gtk_notebook_append_page(GTK_NOTEBOOK(notebook), build_duel_page(state),
+                             gtk_label_new("Duel"));
+    gtk_notebook_append_page(GTK_NOTEBOOK(notebook), build_rank_page(state),
+                             gtk_label_new("Ranking"));
     gtk_notebook_append_page(GTK_NOTEBOOK(notebook), build_chart_page(state),
                              gtk_label_new("Type chart"));
     gtk_container_add(GTK_CONTAINER(window), notebook);
@@ -888,6 +1003,703 @@ static void activate(GtkApplication *app, gpointer data)
      * the panel used to say "select a Pokemon" with row 1 already highlighted.
      */
     select_first_row(state);
+    duel_refresh(state);
+
+    /*
+     * A hook for checking the tabs without a mouse: TSP_AUTORUN=duel runs the
+     * duel, TSP_AUTORUN=rank kicks off the tournament, and either opens the
+     * matching tab. Harmless when the variable is unset.
+     */
+    const char *autorun = g_getenv("TSP_AUTORUN");
+    if (autorun != NULL && strcmp(autorun, "duel") == 0) {
+        gtk_notebook_set_current_page(GTK_NOTEBOOK(notebook), 1);
+        on_duel_run(NULL, state);
+    } else if (autorun != NULL && strcmp(autorun, "rank") == 0) {
+        gtk_notebook_set_current_page(GTK_NOTEBOOK(notebook), 2);
+        on_rank_run(GTK_BUTTON(state->rank_button), state);
+    }
+}
+
+/* ------------------------------------------------------------------ *
+ * Duel tab
+ * ------------------------------------------------------------------ */
+
+/*
+ * A GtkEntryCompletion turns a plain entry into a type-ahead box: it watches
+ * what is typed and offers matching rows from a model. The model here is just
+ * the 1025 names, and inline completion fills in the rest of the word as you
+ * go.
+ */
+static void attach_name_completion(GtkWidget *entry, AppState *state)
+{
+    GtkListStore *names = gtk_list_store_new(2, G_TYPE_STRING, GDK_TYPE_PIXBUF);
+    for (int i = 0; i < state->count; i++) {
+        GtkTreeIter it;
+        gtk_list_store_append(names, &it);
+        gtk_list_store_set(names, &it,
+                           0, state->roster[i].name,
+                           1, sprite_for(state->roster[i].dex),
+                           -1);
+    }
+
+    GtkEntryCompletion *completion = gtk_entry_completion_new();
+    gtk_entry_completion_set_model(completion, GTK_TREE_MODEL(names));
+    g_object_unref(names);
+
+    /* Show the sprite beside each suggestion. */
+    GtkCellRenderer *pix = gtk_cell_renderer_pixbuf_new();
+    gtk_cell_layout_pack_start(GTK_CELL_LAYOUT(completion), pix, FALSE);
+    gtk_cell_layout_add_attribute(GTK_CELL_LAYOUT(completion), pix, "pixbuf", 1);
+
+    gtk_entry_completion_set_text_column(completion, 0);
+    gtk_entry_completion_set_inline_completion(completion, TRUE);
+    gtk_entry_completion_set_popup_completion(completion, TRUE);
+    gtk_entry_completion_set_minimum_key_length(completion, 1);
+    gtk_entry_set_completion(GTK_ENTRY(entry), completion);
+    g_object_unref(completion);
+}
+
+static const Pokemon *duel_pick(AppState *state, int side)
+{
+    const char *text = gtk_entry_get_text(GTK_ENTRY(state->duel_entry[side]));
+    if (text == NULL || *text == '\0') {
+        return NULL;
+    }
+    for (int i = 0; i < state->count; i++) {
+        if (g_ascii_strcasecmp(state->roster[i].name, text) == 0) {
+            return &state->roster[i];
+        }
+    }
+    return NULL;
+}
+
+/* Fill one side of the comparison, and colour the stats against the other. */
+static void duel_show_side(AppState *state, int side, const Pokemon *p,
+                           const Pokemon *other)
+{
+    if (p == NULL) {
+        gtk_label_set_text(GTK_LABEL(state->duel_name[side]), "-");
+        gtk_label_set_text(GTK_LABEL(state->duel_types[side]), "");
+        gtk_label_set_text(GTK_LABEL(state->duel_moves[side]), "");
+        gtk_label_set_text(GTK_LABEL(state->duel_total[side]), "");
+        gtk_image_clear(GTK_IMAGE(state->duel_sprite[side]));
+        for (int i = 0; i < 6; i++) {
+            gtk_label_set_text(GTK_LABEL(state->duel_stat[side][i]), "-");
+            gtk_progress_bar_set_fraction(
+                GTK_PROGRESS_BAR(state->duel_stat_bar[side][i]), 0.0);
+        }
+        return;
+    }
+
+    gtk_label_set_text(GTK_LABEL(state->duel_name[side]), p->name);
+
+    GdkPixbuf *small_sprite = sprite_for(p->dex);
+    if (small_sprite != NULL) {
+        GdkPixbuf *big = gdk_pixbuf_scale_simple(small_sprite, SPRITE_LARGE,
+                                                 SPRITE_LARGE, GDK_INTERP_NEAREST);
+        gtk_image_set_from_pixbuf(GTK_IMAGE(state->duel_sprite[side]), big);
+        g_object_unref(big);
+    }
+
+    GString *types = g_string_new(NULL);
+    append_type_badge(types, p->type1);
+    append_type_badge(types, p->type2);
+    gtk_label_set_markup(GTK_LABEL(state->duel_types[side]), types->str);
+    g_string_free(types, TRUE);
+
+    char total[64];
+    snprintf(total, sizeof total, "BST %d", p->total);
+    gtk_label_set_text(GTK_LABEL(state->duel_total[side]), total);
+
+    int mine[6], theirs[6];
+    get_stats(p, mine);
+    if (other != NULL) {
+        get_stats(other, theirs);
+    }
+
+    for (int i = 0; i < 6; i++) {
+        /* Big enough for the markup, not just the number: a truncated
+         * "<span ...>" is invalid markup and Pango refuses to render it. */
+        char text[96];
+        if (other == NULL) {
+            snprintf(text, sizeof text, "%d", mine[i]);
+        } else if (mine[i] > theirs[i]) {
+            /* The higher stat of the pair is called out in green. */
+            snprintf(text, sizeof text,
+                     "<span foreground=\"#7ddc8c\"><b>%d</b></span>", mine[i]);
+        } else if (mine[i] < theirs[i]) {
+            snprintf(text, sizeof text,
+                     "<span foreground=\"#d98b83\">%d</span>", mine[i]);
+        } else {
+            snprintf(text, sizeof text, "%d", mine[i]);
+        }
+        gtk_label_set_markup(GTK_LABEL(state->duel_stat[side][i]), text);
+        set_stat_bar(state->duel_stat_bar[side][i], mine[i]);
+    }
+
+    /* The four moves it will actually fight with. */
+    GString *moves = g_string_new(NULL);
+    int slots[TEAM_MOVES], n = 0;
+    choose_moveset(p, slots, &n);
+    for (int i = 0; i < n; i++) {
+        const MoveData *m = &move_table[slots[i]];
+        char *escaped = g_markup_escape_text(m->name, -1);
+        char detail[48];
+        if (m->category == CAT_STATUS) {
+            snprintf(detail, sizeof detail, "status");
+        } else if (m->power > 0) {
+            snprintf(detail, sizeof detail, "power %d", m->power);
+        } else {
+            /* Seismic Toss, Gyro Ball and the rest work their power out mid-fight. */
+            snprintf(detail, sizeof detail, "varies");
+        }
+        g_string_append_printf(
+            moves, "<span background=\"%s\" foreground=\"#12151a\" size=\"small\">"
+                   " %s </span> <span size=\"small\" foreground=\"#9aa4b2\">%s</span>\n",
+            TYPE_COLOURS[m->type], escaped, detail);
+        g_free(escaped);
+    }
+    if (n == 0) {
+        g_string_append(moves, "<span foreground=\"#9aa4b2\">no usable moves</span>");
+    }
+    gtk_label_set_markup(GTK_LABEL(state->duel_moves[side]), moves->str);
+    g_string_free(moves, TRUE);
+}
+
+static void duel_refresh(AppState *state)
+{
+    const Pokemon *a = duel_pick(state, 0);
+    const Pokemon *b = duel_pick(state, 1);
+    duel_show_side(state, 0, a, b);
+    duel_show_side(state, 1, b, a);
+}
+
+static void on_duel_entry_changed(GtkEditable *editable, gpointer data)
+{
+    (void)editable;
+    duel_refresh(data);
+}
+
+static void on_duel_run(GtkButton *button, gpointer data)
+{
+    (void)button;
+    AppState *state = data;
+
+    const Pokemon *a = duel_pick(state, 0);
+    const Pokemon *b = duel_pick(state, 1);
+    if (a == NULL || b == NULL) {
+        gtk_label_set_markup(GTK_LABEL(state->duel_result),
+                             "<span foreground=\"#e8a33d\">"
+                             "Pick two Pokemon first.</span>");
+        gtk_label_set_text(GTK_LABEL(state->duel_detail), "");
+        return;
+    }
+
+    int runs = gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(state->duel_runs));
+
+    SeriesStats s;
+    simulate_series(a, b, state->chart, runs, &s);
+
+    double pa = 100.0 * s.a_wins / (s.battles > 0 ? s.battles : 1);
+    double pb = 100.0 * s.b_wins / (s.battles > 0 ? s.battles : 1);
+
+    /*
+     * A win rate from a finite sample has an error bar. This is the usual
+     * normal approximation, 1.96 standard errors, which is roughly a 95%
+     * interval -- enough to tell "clearly ahead" from "too close to call".
+     */
+    double p  = pa / 100.0;
+    double se = 100.0 * sqrt(p * (1.0 - p) / (s.battles > 0 ? s.battles : 1));
+    double margin = 1.96 * se;
+
+    GString *out = g_string_new(NULL);
+    g_string_append_printf(
+        out, "<span size=\"large\"><b>%s %.1f%%</b>   vs   <b>%s %.1f%%</b></span>\n"
+             "<span foreground=\"#9aa4b2\">+/- %.1f%% at 95%% confidence"
+             "   %d draws</span>",
+        a->name, pa, b->name, pb, margin, s.draws);
+    gtk_label_set_markup(GTK_LABEL(state->duel_result), out->str);
+    g_string_free(out, TRUE);
+
+    GString *detail = g_string_new(NULL);
+    g_string_append_printf(detail,
+        "battles      %d\n"
+        "turns        avg %.1f   shortest %d   longest %d\n"
+        "damage       %s %lld   |   %s %lld\n"
+        "crits        %s %d   |   %s %d\n"
+        "misses       %s %d   |   %s %d\n",
+        s.battles,
+        (double)s.total_turns / (s.battles > 0 ? s.battles : 1),
+        s.min_turns, s.max_turns,
+        a->name, s.a_damage, b->name, s.b_damage,
+        a->name, s.a_crits, b->name, s.b_crits,
+        a->name, s.a_misses, b->name, s.b_misses);
+
+    g_string_append_printf(detail, "\nmove usage\n");
+    for (int i = 0; i < TEAM_MOVES; i++) {
+        if (s.a_move_used[i] > 0) {
+            g_string_append_printf(detail, "  %-12s %-18s %d\n",
+                                   i == 0 ? a->name : "", moveset_name(a, i),
+                                   s.a_move_used[i]);
+        }
+    }
+    for (int i = 0; i < TEAM_MOVES; i++) {
+        if (s.b_move_used[i] > 0) {
+            g_string_append_printf(detail, "  %-12s %-18s %d\n",
+                                   i == 0 ? b->name : "", moveset_name(b, i),
+                                   s.b_move_used[i]);
+        }
+    }
+
+    gtk_label_set_text(GTK_LABEL(state->duel_detail), detail->str);
+    g_string_free(detail, TRUE);
+
+    gtk_progress_bar_set_fraction(GTK_PROGRESS_BAR(state->duel_bar), pa / 100.0);
+}
+
+static void on_duel_swap(GtkButton *button, gpointer data)
+{
+    (void)button;
+    AppState *state = data;
+    char *left = g_strdup(gtk_entry_get_text(GTK_ENTRY(state->duel_entry[0])));
+    gtk_entry_set_text(GTK_ENTRY(state->duel_entry[0]),
+                       gtk_entry_get_text(GTK_ENTRY(state->duel_entry[1])));
+    gtk_entry_set_text(GTK_ENTRY(state->duel_entry[1]), left);
+    g_free(left);
+}
+
+/* Build one column of the side-by-side comparison. */
+static GtkWidget *build_duel_side(AppState *state, int side)
+{
+    GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
+    gtk_container_set_border_width(GTK_CONTAINER(box), 10);
+    gtk_style_context_add_class(gtk_widget_get_style_context(box), "panel");
+    gtk_widget_set_size_request(box, 330, -1);
+
+    state->duel_entry[side] = gtk_entry_new();
+    gtk_entry_set_placeholder_text(GTK_ENTRY(state->duel_entry[side]),
+                                   side == 0 ? "Type a name..." : "and another...");
+    attach_name_completion(state->duel_entry[side], state);
+    gtk_box_pack_start(GTK_BOX(box), state->duel_entry[side], FALSE, FALSE, 0);
+
+    GtkWidget *header = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    state->duel_sprite[side] = gtk_image_new();
+    gtk_widget_set_size_request(state->duel_sprite[side], SPRITE_LARGE, SPRITE_LARGE);
+    gtk_box_pack_start(GTK_BOX(header), state->duel_sprite[side], FALSE, FALSE, 0);
+
+    GtkWidget *titles = gtk_box_new(GTK_ORIENTATION_VERTICAL, 2);
+    state->duel_name[side] = gtk_label_new("-");
+    gtk_label_set_xalign(GTK_LABEL(state->duel_name[side]), 0.0);
+    gtk_style_context_add_class(
+        gtk_widget_get_style_context(state->duel_name[side]), "title");
+    gtk_box_pack_start(GTK_BOX(titles), state->duel_name[side], FALSE, FALSE, 0);
+
+    state->duel_types[side] = gtk_label_new("");
+    gtk_label_set_xalign(GTK_LABEL(state->duel_types[side]), 0.0);
+    gtk_box_pack_start(GTK_BOX(titles), state->duel_types[side], FALSE, FALSE, 0);
+
+    state->duel_total[side] = gtk_label_new("");
+    gtk_label_set_xalign(GTK_LABEL(state->duel_total[side]), 0.0);
+    gtk_style_context_add_class(
+        gtk_widget_get_style_context(state->duel_total[side]), "subtle");
+    gtk_box_pack_start(GTK_BOX(titles), state->duel_total[side], FALSE, FALSE, 0);
+
+    gtk_box_pack_start(GTK_BOX(header), titles, TRUE, TRUE, 0);
+    gtk_box_pack_start(GTK_BOX(box), header, FALSE, FALSE, 0);
+
+    GtkWidget *grid = gtk_grid_new();
+    gtk_grid_set_row_spacing(GTK_GRID(grid), 3);
+    gtk_grid_set_column_spacing(GTK_GRID(grid), 8);
+    for (int i = 0; i < 6; i++) {
+        GtkWidget *name = gtk_label_new(STAT_NAMES[i]);
+        gtk_label_set_xalign(GTK_LABEL(name), 0.0);
+        gtk_widget_set_size_request(name, 62, -1);
+        gtk_grid_attach(GTK_GRID(grid), name, 0, i, 1, 1);
+
+        state->duel_stat_bar[side][i] = gtk_progress_bar_new();
+        gtk_widget_set_hexpand(state->duel_stat_bar[side][i], TRUE);
+        gtk_widget_set_valign(state->duel_stat_bar[side][i], GTK_ALIGN_CENTER);
+        gtk_grid_attach(GTK_GRID(grid), state->duel_stat_bar[side][i], 1, i, 1, 1);
+
+        state->duel_stat[side][i] = gtk_label_new("-");
+        gtk_label_set_xalign(GTK_LABEL(state->duel_stat[side][i]), 1.0);
+        gtk_widget_set_size_request(state->duel_stat[side][i], 36, -1);
+        gtk_grid_attach(GTK_GRID(grid), state->duel_stat[side][i], 2, i, 1, 1);
+    }
+    gtk_box_pack_start(GTK_BOX(box), grid, FALSE, FALSE, 4);
+
+    GtkWidget *moves_title = gtk_label_new("Moves it will fight with");
+    gtk_label_set_xalign(GTK_LABEL(moves_title), 0.0);
+    gtk_style_context_add_class(gtk_widget_get_style_context(moves_title), "heading");
+    gtk_box_pack_start(GTK_BOX(box), moves_title, FALSE, FALSE, 0);
+
+    state->duel_moves[side] = gtk_label_new("");
+    gtk_label_set_xalign(GTK_LABEL(state->duel_moves[side]), 0.0);
+    gtk_box_pack_start(GTK_BOX(box), state->duel_moves[side], FALSE, FALSE, 0);
+
+    return box;
+}
+
+static GtkWidget *build_duel_page(AppState *state)
+{
+    GtkWidget *page = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
+    gtk_container_set_border_width(GTK_CONTAINER(page), 10);
+
+    /* --- the two sides --- */
+    GtkWidget *sides = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    gtk_box_pack_start(GTK_BOX(sides), build_duel_side(state, 0), TRUE, TRUE, 0);
+
+    GtkWidget *middle = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
+    gtk_widget_set_valign(middle, GTK_ALIGN_CENTER);
+    GtkWidget *vs = gtk_label_new("vs");
+    gtk_style_context_add_class(gtk_widget_get_style_context(vs), "title");
+    gtk_box_pack_start(GTK_BOX(middle), vs, FALSE, FALSE, 0);
+    GtkWidget *swap = gtk_button_new_with_label("swap");
+    gtk_box_pack_start(GTK_BOX(middle), swap, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(sides), middle, FALSE, FALSE, 0);
+
+    gtk_box_pack_start(GTK_BOX(sides), build_duel_side(state, 1), TRUE, TRUE, 0);
+    gtk_box_pack_start(GTK_BOX(page), sides, FALSE, FALSE, 0);
+
+    /* --- controls --- */
+    GtkWidget *controls = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    GtkWidget *runs_label = gtk_label_new("Battles");
+    gtk_box_pack_start(GTK_BOX(controls), runs_label, FALSE, FALSE, 0);
+
+    state->duel_runs = gtk_spin_button_new_with_range(1, 100000, 100);
+    gtk_spin_button_set_value(GTK_SPIN_BUTTON(state->duel_runs), 1000);
+    gtk_box_pack_start(GTK_BOX(controls), state->duel_runs, FALSE, FALSE, 0);
+
+    GtkWidget *run = gtk_button_new_with_label("Run the simulation");
+    gtk_box_pack_start(GTK_BOX(controls), run, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(page), controls, FALSE, FALSE, 0);
+
+    /* --- results --- */
+    GtkWidget *results = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
+    gtk_container_set_border_width(GTK_CONTAINER(results), 10);
+    gtk_style_context_add_class(gtk_widget_get_style_context(results), "panel");
+
+    state->duel_result = gtk_label_new("Pick two Pokemon and run the simulation.");
+    gtk_label_set_xalign(GTK_LABEL(state->duel_result), 0.0);
+    gtk_box_pack_start(GTK_BOX(results), state->duel_result, FALSE, FALSE, 0);
+
+    state->duel_bar = gtk_progress_bar_new();
+    gtk_style_context_add_class(gtk_widget_get_style_context(state->duel_bar),
+                                "s-high");
+    gtk_box_pack_start(GTK_BOX(results), state->duel_bar, FALSE, FALSE, 0);
+
+    state->duel_detail = gtk_label_new("");
+    gtk_label_set_xalign(GTK_LABEL(state->duel_detail), 0.0);
+    PangoAttrList *mono = pango_attr_list_new();
+    pango_attr_list_insert(mono, pango_attr_family_new("monospace"));
+    gtk_label_set_attributes(GTK_LABEL(state->duel_detail), mono);
+    pango_attr_list_unref(mono);
+    gtk_box_pack_start(GTK_BOX(results), state->duel_detail, TRUE, TRUE, 0);
+
+    gtk_box_pack_start(GTK_BOX(page), results, TRUE, TRUE, 0);
+
+    g_signal_connect(state->duel_entry[0], "changed",
+                     G_CALLBACK(on_duel_entry_changed), state);
+    g_signal_connect(state->duel_entry[1], "changed",
+                     G_CALLBACK(on_duel_entry_changed), state);
+    g_signal_connect(run, "clicked", G_CALLBACK(on_duel_run), state);
+    g_signal_connect(swap, "clicked", G_CALLBACK(on_duel_swap), state);
+
+    /* Something in the boxes to start with. */
+    gtk_entry_set_text(GTK_ENTRY(state->duel_entry[0]), "Charizard");
+    gtk_entry_set_text(GTK_ENTRY(state->duel_entry[1]), "Blastoise");
+
+    return page;
+}
+
+/* ------------------------------------------------------------------ *
+ * Ranking tab
+ * ------------------------------------------------------------------ */
+
+/*
+ * The round robin takes seconds, not milliseconds, so it runs on its own
+ * thread. GTK is not thread-safe, so the worker touches nothing but the
+ * numbers in AppState; a timeout on the main loop reads those and updates the
+ * widgets. That is the standard division of labour for background work in GTK.
+ */
+static void rank_progress_cb(double fraction, void *user_data)
+{
+    AppState *state = user_data;
+    state->progress = fraction;
+}
+
+static gpointer rank_worker(gpointer data)
+{
+    AppState *state = data;
+    GTimer   *timer = g_timer_new();
+
+    run_tournament(state->roster, state->count, state->chart,
+                   state->worker_runs, state->results,
+                   &state->cancel, rank_progress_cb, state);
+
+    state->worker_seconds = g_timer_elapsed(timer, NULL);
+    g_timer_destroy(timer);
+    state->worker_done = 1;
+    return NULL;
+}
+
+static void rank_fill_table(AppState *state)
+{
+    gtk_list_store_clear(state->rank_store);
+
+    /* Sort a copy by wins so the rank column means something. */
+    int *order = g_malloc_n(state->count, sizeof *order);
+    for (int i = 0; i < state->count; i++) {
+        order[i] = i;
+    }
+    for (int i = 1; i < state->count; i++) {      /* insertion sort, once */
+        int key = order[i];
+        int j = i - 1;
+        while (j >= 0 && state->results[order[j]].wins < state->results[key].wins) {
+            order[j + 1] = order[j];
+            j--;
+        }
+        order[j + 1] = key;
+    }
+
+    for (int r = 0; r < state->count; r++) {
+        int              i = order[r];
+        const RankEntry *e = &state->results[i];
+        const Pokemon   *p = &state->roster[i];
+        int battles = (e->battles > 0) ? e->battles : 1;
+
+        GtkTreeIter it;
+        gtk_list_store_append(state->rank_store, &it);
+        gtk_list_store_set(state->rank_store, &it,
+            RK_RANK,     r + 1,
+            RK_ICON,     sprite_for(p->dex),
+            RK_NAME,     p->name,
+            RK_TYPE1,    type_name(p->type1),
+            RK_TYPE2,    (p->type2 == TYPE_NONE) ? "" : type_name(p->type2),
+            RK_WINS,     e->wins,
+            RK_LOSSES,   e->losses,
+            RK_DRAWS,    e->draws,
+            RK_WINPCT,   100.0 * e->wins / battles,
+            RK_TOTAL,    p->total,
+            RK_AVGTURNS, (double)e->turns / battles,
+            RK_DMGRATIO, (double)e->damage_dealt /
+                         (e->damage_taken > 0 ? (double)e->damage_taken : 1.0),
+            RK_INDEX,    i,
+            -1);
+    }
+    g_free(order);
+}
+
+/* Called on the main loop while the worker runs. */
+static gboolean rank_poll(gpointer data)
+{
+    AppState *state = data;
+
+    gtk_progress_bar_set_fraction(GTK_PROGRESS_BAR(state->rank_progress),
+                                  state->progress);
+    char text[128];
+    long long pairs = (long long)state->count * (state->count - 1) / 2;
+    snprintf(text, sizeof text, "%.0f%% -- %lld of %lld pairings",
+             state->progress * 100.0,
+             (long long)(state->progress * pairs), pairs);
+    gtk_progress_bar_set_text(GTK_PROGRESS_BAR(state->rank_progress), text);
+
+    if (!state->worker_done) {
+        return G_SOURCE_CONTINUE;
+    }
+
+    g_thread_join(state->worker);
+    state->worker = NULL;
+
+    rank_fill_table(state);
+
+    snprintf(text, sizeof text,
+             "%lld battles in %.1f s   (%.0f/second)",
+             pairs * state->worker_runs, state->worker_seconds,
+             (double)(pairs * state->worker_runs) /
+             (state->worker_seconds > 0 ? state->worker_seconds : 1));
+    gtk_label_set_text(GTK_LABEL(state->rank_status), text);
+    gtk_button_set_label(GTK_BUTTON(state->rank_button), "Run the tournament");
+    gtk_widget_set_sensitive(state->rank_button, TRUE);
+    gtk_widget_set_sensitive(state->rank_runs, TRUE);
+    gtk_progress_bar_set_fraction(GTK_PROGRESS_BAR(state->rank_progress), 1.0);
+    gtk_progress_bar_set_text(GTK_PROGRESS_BAR(state->rank_progress), "done");
+
+    return G_SOURCE_REMOVE;
+}
+
+static void on_rank_run(GtkButton *button, gpointer data)
+{
+    AppState *state = data;
+
+    if (state->worker != NULL) {            /* already running: cancel it */
+        state->cancel = 1;
+        gtk_button_set_label(button, "Stopping...");
+        gtk_widget_set_sensitive(GTK_WIDGET(button), FALSE);
+        return;
+    }
+
+    if (state->results == NULL) {
+        state->results = g_malloc0_n(state->count, sizeof(RankEntry));
+    }
+
+    state->worker_runs = gtk_spin_button_get_value_as_int(
+        GTK_SPIN_BUTTON(state->rank_runs));
+    state->cancel      = 0;
+    state->worker_done = 0;
+    state->progress    = 0.0;
+
+    gtk_button_set_label(button, "Stop");
+    gtk_widget_set_sensitive(state->rank_runs, FALSE);
+    gtk_label_set_text(GTK_LABEL(state->rank_status), "running...");
+
+    state->worker = g_thread_new("tournament", rank_worker, state);
+    g_timeout_add(100, rank_poll, state);
+}
+
+static gboolean rank_row_visible(GtkTreeModel *model, GtkTreeIter *iter,
+                                 gpointer data)
+{
+    AppState *state = data;
+    int index = -1;
+    gtk_tree_model_get(model, iter, RK_INDEX, &index, -1);
+    if (index < 0 || index >= state->count) {
+        return FALSE;
+    }
+    const Pokemon *p = &state->roster[index];
+
+    if (state->rank_type_filter != TYPE_NONE &&
+        p->type1 != state->rank_type_filter &&
+        p->type2 != state->rank_type_filter) {
+        return FALSE;
+    }
+    if (state->rank_search_text[0] != '\0') {
+        char lowered[NAME_LEN];
+        snprintf(lowered, sizeof lowered, "%s", p->name);
+        for (char *c = lowered; *c; c++) {
+            *c = (char)g_ascii_tolower(*c);
+        }
+        if (strstr(lowered, state->rank_search_text) == NULL) {
+            return FALSE;
+        }
+    }
+    return TRUE;
+}
+
+static void on_rank_search(GtkSearchEntry *entry, gpointer data)
+{
+    AppState *state = data;
+    snprintf(state->rank_search_text, sizeof state->rank_search_text,
+             "%s", gtk_entry_get_text(GTK_ENTRY(entry)));
+    for (char *c = state->rank_search_text; *c; c++) {
+        *c = (char)g_ascii_tolower(*c);
+    }
+    gtk_tree_model_filter_refilter(GTK_TREE_MODEL_FILTER(state->rank_filter));
+}
+
+static void on_rank_type(GtkComboBox *combo, gpointer data)
+{
+    AppState *state = data;
+    int active = gtk_combo_box_get_active(combo);
+    state->rank_type_filter = (active <= 0) ? TYPE_NONE : active - 1;
+    gtk_tree_model_filter_refilter(GTK_TREE_MODEL_FILTER(state->rank_filter));
+}
+
+static GtkWidget *build_rank_page(AppState *state)
+{
+    GtkWidget *page = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
+    gtk_container_set_border_width(GTK_CONTAINER(page), 10);
+    state->rank_type_filter = TYPE_NONE;
+
+    /* --- run bar --- */
+    GtkWidget *bar = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+
+    state->rank_button = gtk_button_new_with_label("Run the tournament");
+    gtk_box_pack_start(GTK_BOX(bar), state->rank_button, FALSE, FALSE, 0);
+
+    gtk_box_pack_start(GTK_BOX(bar), gtk_label_new("battles per pairing"),
+                       FALSE, FALSE, 0);
+    state->rank_runs = gtk_spin_button_new_with_range(1, 501, 2);
+    gtk_spin_button_set_value(GTK_SPIN_BUTTON(state->rank_runs), 11);
+    gtk_box_pack_start(GTK_BOX(bar), state->rank_runs, FALSE, FALSE, 0);
+
+    state->rank_progress = gtk_progress_bar_new();
+    gtk_progress_bar_set_show_text(GTK_PROGRESS_BAR(state->rank_progress), TRUE);
+    gtk_progress_bar_set_text(GTK_PROGRESS_BAR(state->rank_progress),
+                              "not run yet");
+    gtk_widget_set_valign(state->rank_progress, GTK_ALIGN_CENTER);
+    gtk_widget_set_hexpand(state->rank_progress, TRUE);
+    gtk_box_pack_start(GTK_BOX(bar), state->rank_progress, TRUE, TRUE, 0);
+
+    gtk_box_pack_start(GTK_BOX(page), bar, FALSE, FALSE, 0);
+
+    state->rank_status = gtk_label_new(
+        "1025 species, 524,800 pairings. 11 battles each is about 6 million "
+        "battles and takes a few seconds.");
+    gtk_label_set_xalign(GTK_LABEL(state->rank_status), 0.0);
+    gtk_style_context_add_class(gtk_widget_get_style_context(state->rank_status),
+                                "subtle");
+    gtk_box_pack_start(GTK_BOX(page), state->rank_status, FALSE, FALSE, 0);
+
+    /* --- filters --- */
+    GtkWidget *filters = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    state->rank_search = gtk_search_entry_new();
+    gtk_entry_set_placeholder_text(GTK_ENTRY(state->rank_search),
+                                   "Filter by name...");
+    gtk_widget_set_hexpand(state->rank_search, TRUE);
+    gtk_box_pack_start(GTK_BOX(filters), state->rank_search, TRUE, TRUE, 0);
+
+    state->rank_type_combo = gtk_combo_box_text_new();
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(state->rank_type_combo),
+                                   "All types");
+    for (int i = 0; i < TYPE_COUNT; i++) {
+        gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(state->rank_type_combo),
+                                       TYPE_NAMES[i]);
+    }
+    gtk_combo_box_set_active(GTK_COMBO_BOX(state->rank_type_combo), 0);
+    gtk_box_pack_start(GTK_BOX(filters), state->rank_type_combo, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(page), filters, FALSE, FALSE, 0);
+
+    /* --- the table --- */
+    state->rank_store = gtk_list_store_new(RK_N,
+        G_TYPE_INT, GDK_TYPE_PIXBUF, G_TYPE_STRING, G_TYPE_STRING, G_TYPE_STRING,
+        G_TYPE_INT, G_TYPE_INT, G_TYPE_INT, G_TYPE_DOUBLE, G_TYPE_INT,
+        G_TYPE_DOUBLE, G_TYPE_DOUBLE, G_TYPE_INT);
+
+    state->rank_filter = gtk_tree_model_filter_new(
+        GTK_TREE_MODEL(state->rank_store), NULL);
+    gtk_tree_model_filter_set_visible_func(
+        GTK_TREE_MODEL_FILTER(state->rank_filter), rank_row_visible, state, NULL);
+
+    GtkTreeModel *sorted = gtk_tree_model_sort_new_with_model(state->rank_filter);
+    state->rank_tree = gtk_tree_view_new_with_model(sorted);
+
+    add_column(state->rank_tree, "#",      RK_RANK,   46,  TRUE);
+    add_icon_column(state->rank_tree, RK_ICON);
+    add_column(state->rank_tree, "Name",   RK_NAME,   116, FALSE);
+    add_column(state->rank_tree, "Type",   RK_TYPE1,  72,  FALSE);
+    add_column(state->rank_tree, "",       RK_TYPE2,  72,  FALSE);
+    add_column(state->rank_tree, "Wins",   RK_WINS,   66,  TRUE);
+    add_column(state->rank_tree, "Losses", RK_LOSSES, 66,  TRUE);
+    add_column(state->rank_tree, "Draws",  RK_DRAWS,  58,  TRUE);
+    add_percent_column(state->rank_tree, "Win %",   RK_WINPCT);
+    add_column(state->rank_tree, "BST",    RK_TOTAL,  56,  TRUE);
+    add_decimal_column(state->rank_tree, "Turns",   RK_AVGTURNS);
+    add_decimal_column(state->rank_tree, "Dmg +/-", RK_DMGRATIO);
+
+    GtkWidget *scroll = gtk_scrolled_window_new(NULL, NULL);
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scroll),
+                                   GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
+    gtk_container_add(GTK_CONTAINER(scroll), state->rank_tree);
+    gtk_box_pack_start(GTK_BOX(page), scroll, TRUE, TRUE, 0);
+
+    g_signal_connect(state->rank_button, "clicked", G_CALLBACK(on_rank_run), state);
+    g_signal_connect(state->rank_search, "search-changed",
+                     G_CALLBACK(on_rank_search), state);
+    g_signal_connect(state->rank_type_combo, "changed",
+                     G_CALLBACK(on_rank_type), state);
+
+    return page;
 }
 
 /* ------------------------------------------------------------------ *

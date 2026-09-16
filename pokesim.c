@@ -302,6 +302,9 @@ static void load_css(void)
         "treeview header button { background-color: #2f3640; color: #9aa4b2;\n"
         "                         border: 0; padding: 4px; }\n"
         "scrollbar { background-color: #262b33; }\n"
+        "scrollbar slider { background-color: #5a6472; min-width: 12px;\n"
+        "                   min-height: 40px; border-radius: 6px; }\n"
+        "scrollbar slider:hover { background-color: #74808f; }\n"
         "separator { background-color: #39404a; }\n"
         /* The percentage sits on top of the filled bar, so it needs a colour
          * that reads against both the filled and unfilled halves. */
@@ -637,6 +640,22 @@ static void add_number_column(GtkWidget *tree, const char *title, int column)
  * the column keep the real number for sorting while showing a rounded one.
  * The suffix ("%" or nothing) rides along in the user data.
  */
+/*
+ * GTK 3 defaults to overlay scrollbars: a thin strip that only appears when
+ * the pointer is near it and is easy to miss entirely. For a window full of
+ * long lists that reads as "it will not scroll", so every scroller in this
+ * program is told to use a real, permanently visible bar that takes up its
+ * own space.
+ */
+static GtkWidget *make_scroller(GtkPolicyType horizontal)
+{
+    GtkWidget *scroll = gtk_scrolled_window_new(NULL, NULL);
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scroll),
+                                   horizontal, GTK_POLICY_AUTOMATIC);
+    gtk_scrolled_window_set_overlay_scrolling(GTK_SCROLLED_WINDOW(scroll), FALSE);
+    return scroll;
+}
+
 static void format_decimal(GtkTreeViewColumn *col, GtkCellRenderer *cell,
                            GtkTreeModel *model, GtkTreeIter *iter,
                            gpointer data)
@@ -797,9 +816,7 @@ static GtkWidget *build_dex_page(AppState *state)
     add_number_column(state->tree, "Spe",   COL_SPE);
     add_number_column(state->tree, "Total", COL_TOTAL);
 
-    GtkWidget *scroll = gtk_scrolled_window_new(NULL, NULL);
-    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scroll),
-                                   GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
+    GtkWidget *scroll = make_scroller(GTK_POLICY_AUTOMATIC);
     gtk_container_add(GTK_CONTAINER(scroll), state->tree);
     gtk_widget_set_size_request(scroll, TABLE_WIDTH, -1);
 
@@ -864,9 +881,7 @@ static GtkWidget *build_dex_page(AppState *state)
     add_number_column(move_tree, "Lv",   MOVE_COL_LEVEL);
     add_text_column(move_tree,   "Move", MOVE_COL_NAME);
 
-    GtkWidget *move_scroll = gtk_scrolled_window_new(NULL, NULL);
-    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(move_scroll),
-                                   GTK_POLICY_NEVER, GTK_POLICY_AUTOMATIC);
+    GtkWidget *move_scroll = make_scroller(GTK_POLICY_NEVER);
     gtk_container_add(GTK_CONTAINER(move_scroll), move_tree);
     gtk_widget_set_vexpand(move_scroll, TRUE);
     gtk_box_pack_start(GTK_BOX(details), move_scroll, TRUE, TRUE, 0);
@@ -977,7 +992,7 @@ static GtkWidget *build_chart_page(AppState *state)
     gtk_widget_set_halign(grid, GTK_ALIGN_CENTER);
     gtk_widget_set_valign(grid, GTK_ALIGN_START);
 
-    GtkWidget *scroll = gtk_scrolled_window_new(NULL, NULL);
+    GtkWidget *scroll = make_scroller(GTK_POLICY_AUTOMATIC);
     gtk_container_add(GTK_CONTAINER(scroll), grid);
     return scroll;
 }
@@ -1458,17 +1473,13 @@ static GtkWidget *build_duel_page(AppState *state)
     pango_attr_list_unref(mono);
 
     /*
-     * The move breakdown grows with however many moves each side used, so it
-     * can outgrow the panel on a short window. A scroller means the numbers
-     * are always reachable instead of being silently clipped.
+     * No scroller of its own -- the whole page scrolls, so this can simply be
+     * as tall as its contents need. Nesting a second scroller inside the page
+     * one would give two bars fighting over the same wheel.
      */
-    GtkWidget *detail_scroll = gtk_scrolled_window_new(NULL, NULL);
-    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(detail_scroll),
-                                   GTK_POLICY_NEVER, GTK_POLICY_AUTOMATIC);
-    gtk_container_add(GTK_CONTAINER(detail_scroll), state->duel_detail);
-    gtk_box_pack_start(GTK_BOX(results), detail_scroll, TRUE, TRUE, 0);
+    gtk_box_pack_start(GTK_BOX(results), state->duel_detail, FALSE, FALSE, 0);
 
-    gtk_box_pack_start(GTK_BOX(page), results, TRUE, TRUE, 0);
+    gtk_box_pack_start(GTK_BOX(page), results, FALSE, FALSE, 0);
 
     g_signal_connect(state->duel_entry[0], "changed",
                      G_CALLBACK(on_duel_entry_changed), state);
@@ -1481,7 +1492,14 @@ static GtkWidget *build_duel_page(AppState *state)
     gtk_entry_set_text(GTK_ENTRY(state->duel_entry[0]), "Charizard");
     gtk_entry_set_text(GTK_ENTRY(state->duel_entry[1]), "Blastoise");
 
-    return page;
+    /*
+     * The page as a whole scrolls. The two comparison panels alone are most of
+     * a screen, so on anything short of a large monitor the results below them
+     * would otherwise be cut off with no way to reach them.
+     */
+    GtkWidget *page_scroll = make_scroller(GTK_POLICY_NEVER);
+    gtk_container_add(GTK_CONTAINER(page_scroll), page);
+    return page_scroll;
 }
 
 /* ------------------------------------------------------------------ *
@@ -1759,9 +1777,7 @@ static GtkWidget *build_rank_page(AppState *state)
     add_decimal_column(state->rank_tree, "Avg turns",  RK_AVGTURNS);
     add_decimal_column(state->rank_tree, "Dmg ratio",  RK_DMGRATIO);
 
-    GtkWidget *scroll = gtk_scrolled_window_new(NULL, NULL);
-    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scroll),
-                                   GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
+    GtkWidget *scroll = make_scroller(GTK_POLICY_AUTOMATIC);
     gtk_container_add(GTK_CONTAINER(scroll), state->rank_tree);
     gtk_box_pack_start(GTK_BOX(page), scroll, TRUE, TRUE, 0);
 

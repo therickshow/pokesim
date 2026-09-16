@@ -64,6 +64,9 @@ enum { MOVE_COL_LEVEL, MOVE_COL_NAME, MOVE_N_COLUMNS };
 #define SPRITE_LARGE   96      /* detail panel, scaled 3x from 32x32 */
 #define SPRITE_COLUMN  38      /* table column: 32px plus a little padding */
 
+/* Window and taskbar icon. */
+#define APP_ICON      "simball.png"
+
 static const char *STAT_NAMES[6] = {
     "HP", "Attack", "Defense", "Sp. Atk", "Sp. Def", "Speed"
 };
@@ -206,6 +209,28 @@ static void sprites_init(void)
 
     g_printerr("No %s/ directory found -- the table will have no icons.\n",
                SPRITE_DIR);
+}
+
+/*
+ * The window and taskbar icon. Setting it as the *default* icon rather than on
+ * one window means every window the program opens picks it up, including
+ * dialogs, without having to be told.
+ */
+static void load_app_icon(void)
+{
+    static const char *candidates[] = {
+        APP_ICON, "../" APP_ICON, "../../" APP_ICON
+    };
+
+    for (size_t i = 0; i < sizeof candidates / sizeof candidates[0]; i++) {
+        GdkPixbuf *icon = gdk_pixbuf_new_from_file(candidates[i], NULL);
+        if (icon != NULL) {
+            gtk_window_set_default_icon(icon);
+            g_object_unref(icon);
+            return;
+        }
+    }
+    g_printerr("No %s found -- the window will use the default icon.\n", APP_ICON);
 }
 
 /* The cached 16x16 sprite for a dex number, or NULL if there is not one. */
@@ -975,6 +1000,7 @@ static void activate(GtkApplication *app, gpointer data)
 
     load_css();
     sprites_init();
+    load_app_icon();
 
     GtkWidget *window = gtk_application_window_new(app);
     gtk_window_set_title(GTK_WINDOW(window), "PokeSim");
@@ -1006,11 +1032,11 @@ static void activate(GtkApplication *app, gpointer data)
     duel_refresh(state);
 
     /*
-     * A hook for checking the tabs without a mouse: TSP_AUTORUN=duel runs the
-     * duel, TSP_AUTORUN=rank kicks off the tournament, and either opens the
+     * A hook for checking the tabs without a mouse: POKESIM_AUTORUN=duel runs the
+     * duel, POKESIM_AUTORUN=rank kicks off the tournament, and either opens the
      * matching tab. Harmless when the variable is unset.
      */
-    const char *autorun = g_getenv("TSP_AUTORUN");
+    const char *autorun = g_getenv("POKESIM_AUTORUN");
     if (autorun != NULL && strcmp(autorun, "duel") == 0) {
         gtk_notebook_set_current_page(GTK_NOTEBOOK(notebook), 1);
         on_duel_run(NULL, state);

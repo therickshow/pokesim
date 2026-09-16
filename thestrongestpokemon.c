@@ -651,11 +651,19 @@ static int run_tests(const Pokemon *roster, int count,
     }
     check(duplicates == 0, "no two species share a name");
 
-    /* UTF-8 survived the round trip byte for byte. */
-    check(strcmp(roster[82].name, "Farfetch\xe2\x80\x99d") == 0,
+    /*
+     * UTF-8 survived the round trip byte for byte.
+     *
+     * The literals are split deliberately. A hex escape in C has no length
+     * limit -- it swallows every hex digit that follows -- so "\x99d" is one
+     * escape for 0x99d, which overflows a char, rather than 0x99 then 'd'.
+     * Ending the literal ends the escape, and adjacent literals are then
+     * joined back together by the compiler.
+     */
+    check(strcmp(roster[82].name, "Farfetch\xe2\x80\x99" "d") == 0,
           "Farfetch'd keeps its U+2019 apostrophe");
     check(strlen(roster[82].name) == 12, "  and is 12 bytes long for 10 glyphs");
-    check(strcmp(roster[668].name, "Flab\xc3\xa9b\xc3\xa9") == 0,
+    check(strcmp(roster[668].name, "Flab\xc3\xa9" "b\xc3\xa9") == 0,
           "Flabebe keeps its accents");
 
     /* The species that make a turn cap necessary. */

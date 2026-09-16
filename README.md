@@ -2,6 +2,25 @@
 
 Determines the strongest Pokemon by a set of user-defined criteria
 
+## What it does
+
+A GTK Pokedex over the 1025-species roster and the 18x18 type chart:
+search, type filter, sortable columns, per-species stat bars, live type
+matchups computed from the chart, and the full chart on its own tab.
+
+```powershell
+python "..\library\scriptsuild.py" --run   # open the window
+build	hestrongestpokemon.exe --report        # console summary
+build	hestrongestpokemon.exe --test          # 38 self-tests
+```
+
+The window is a fixed 16:10 (1200x750 logical px) and is deliberately not
+resizable -- the column widths are budgeted against that width.
+
+There are no battles yet. Ranking every species by round-robin simulation
+needs move data (power, accuracy, type, physical/special) for the 708 moves
+the roster refers to, which the current CSVs do not contain.
+
 ## Build
 
 ```powershell

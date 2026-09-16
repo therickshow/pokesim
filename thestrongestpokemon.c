@@ -1,17 +1,30 @@
 /*
- * thestrongestpokemon -- Stage 1: the data layer.
+ * thestrongestpokemon -- Stage 2: a GTK front end for the data layer.
  *
- * Loads the 1025-species roster and the 18x18 type chart, checks that both are
- * internally consistent, and reports what it found. There are no battles yet.
- * The whole point of this stage is to prove the data is sound before any
- * ranking logic is built on top of it.
+ * The loader lives in thestrongestpokemon_data.c. This file is the part you
+ * look at: a browsable Pokedex with search, filtering, sortable columns, a
+ * detail panel, and the full type chart.
  *
- *     thestrongestpokemon                 load, verify, report
- *     thestrongestpokemon --test          run the self-tests
+ *     thestrongestpokemon              open the window
+ *     thestrongestpokemon --report     the old console summary
+ *     thestrongestpokemon --test       run the self-tests
+ *
+ * There are still no battles. This is the shell the tournament results will
+ * eventually live in, built now because browsing the data by hand is the
+ * fastest way to notice when something about it is wrong.
+ *
+ * The GUI is event-driven: instead of our code deciding what happens next,
+ * GTK calls our callbacks when the user types, clicks or selects. That is the
+ * main shift from a console program, and it is why so much state has to be
+ * bundled into a struct that the callbacks can reach.
  *
  * Author: Ricky
  * Created: 2026-09-16
  */
+
+#include "thestrongestpokemon_data.h"
+
+#include <gtk/gtk.h>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -21,474 +34,763 @@
 #include <windows.h>
 #endif
 
-/* ------------------------------------------------------------------ *
- * Sizes.  Every one of these is set from the real data, not guessed.
- * The numbers in the comments are what the supplied CSVs actually contain.
- * ------------------------------------------------------------------ */
-
-#define MAX_POKEMON      1025   /* exactly 1025 species in the file       */
-#define MAX_MOVES          40   /* most is Gallade with 33                */
-#define NAME_LEN           24   /* longest is 12 bytes (Farfetch'd)       */
-#define MOVE_NAME_LEN      32   /* longest is 18 bytes (Nature's Madness) */
-#define LINE_LEN         2048   /* longest raw line is 669 bytes          */
-#define TYPE_COUNT         18
-#define FIELD_COUNT        12   /* columns in the roster CSV              */
-
-#define TYPE_NONE          (-1) /* a single-typed Pokemon's second type   */
-
-/*
- * Type order matters and is NOT alphabetical: it is the order the columns
- * appear in type_chart_18x18.csv. If these two ever disagree the chart gets
- * silently transposed, so load_type_chart() checks the header against this
- * array and refuses to run if they differ.
- */
-static const char *TYPE_NAMES[TYPE_COUNT] = {
-    "Normal",   "Fighting", "Flying", "Poison", "Ground", "Rock",
-    "Bug",      "Ghost",    "Steel",  "Fire",   "Water",  "Grass",
-    "Electric", "Psychic",  "Ice",    "Dragon", "Dark",   "Fairy"
+/* Columns in the list store behind the table. */
+enum {
+    COL_DEX, COL_NAME, COL_TYPE1, COL_TYPE2,
+    COL_HP, COL_ATK, COL_DEF, COL_SPA, COL_SPD, COL_SPE, COL_TOTAL,
+    COL_INDEX,          /* index into roster[] -- hidden from the user */
+    N_COLUMNS
 };
 
+enum { MOVE_COL_LEVEL, MOVE_COL_NAME, MOVE_N_COLUMNS };
+
+/*
+ * The window is a fixed 16:10 -- the same shape as the display -- and cannot
+ * be resized. Every width further down is budgeted against these numbers, so
+ * allowing a resize would only let the user break the layout. They are
+ * logical pixels: on this HiDPI screen GTK doubles them for you.
+ */
+#define WINDOW_WIDTH   1200
+#define WINDOW_HEIGHT   750
+#define PANEL_WIDTH     380
+#define TABLE_WIDTH     780
+
+static const char *STAT_NAMES[6] = {
+    "HP", "Attack", "Defense", "Sp. Atk", "Sp. Def", "Speed"
+};
+
+/*
+ * Everything the callbacks need. GTK hands a callback exactly one user_data
+ * pointer, so the normal pattern is to bundle the widgets and the data into
+ * one struct and pass its address.
+ */
 typedef struct {
-    char name[MOVE_NAME_LEN];
-    int  level;                 /* 0 means "learned on evolution" */
-} Move;
+    Pokemon *roster;
+    int      count;
+    double (*chart)[TYPE_COUNT];
 
-typedef struct {
-    int  dex;
-    char name[NAME_LEN];
-    int  type1;                 /* index into TYPE_NAMES         */
-    int  type2;                 /* index, or TYPE_NONE if single */
-    int  hp, attack, defense, sp_atk, sp_def, speed;
-    int  total;                 /* as stated in the file         */
-    Move moves[MAX_MOVES];
-    int  move_count;
-} Pokemon;
+    GtkListStore *store;
+    GtkTreeModel *filter;
+    GtkWidget    *tree;
+    GtkWidget    *search;
+    GtkWidget    *type_combo;
+    GtkWidget    *count_label;
 
-/* ------------------------------------------------------------------ *
- * Small helpers
- * ------------------------------------------------------------------ */
+    /* Detail panel */
+    GtkWidget    *detail_stack;      /* swaps placeholder <-> details */
+    GtkWidget    *detail_name;
+    GtkWidget    *detail_types;
+    GtkWidget    *detail_total;
+    GtkWidget    *stat_bar[6];
+    GtkWidget    *stat_value[6];
+    GtkWidget    *weak_label;
+    GtkWidget    *resist_label;
+    GtkWidget    *immune_label;
+    GtkListStore *move_store;
+    GtkWidget    *move_count_label;
 
-static int stat_sum(const Pokemon *p)
+    /* Current filter settings, kept lowercased for cheap comparison. */
+    char search_text[NAME_LEN];
+    int  type_filter;                /* TYPE_NONE means "all types" */
+} AppState;
+
+static void get_stats(const Pokemon *p, int out[6])
 {
-    return p->hp + p->attack + p->defense + p->sp_atk + p->sp_def + p->speed;
+    out[0] = p->hp;     out[1] = p->attack; out[2] = p->defense;
+    out[3] = p->sp_atk; out[4] = p->sp_def; out[5] = p->speed;
 }
 
-/* Strip leading and trailing whitespace (including the CR of CRLF) in place. */
-static void trim(char *s)
+/* ------------------------------------------------------------------ *
+ * Styling
+ * ------------------------------------------------------------------ */
+
+/*
+ * GTK is styled with CSS, much like a web page. Loading it into the default
+ * screen means every widget in the app can use these classes.
+ */
+static void load_css(void)
 {
-    size_t len = strlen(s);
-    while (len > 0 && (s[len - 1] == '\n' || s[len - 1] == '\r' ||
-                       s[len - 1] == ' '  || s[len - 1] == '\t')) {
-        s[--len] = '\0';
-    }
-    size_t start = 0;
-    while (s[start] == ' ' || s[start] == '\t') {
-        start++;
-    }
-    if (start > 0) {
-        memmove(s, s + start, len - start + 1);
-    }
+    /*
+     * Every widget that draws its own background needs its foreground set to
+     * match. A blanket "label { color: white }" looks fine until you notice
+     * the buttons and notebook tabs, which keep their light backgrounds and
+     * end up white-on-white -- so those get styled explicitly here rather
+     * than inheriting.
+     */
+    static const char *css =
+        "window, notebook, notebook > stack { background-color: #1e2228; }\n"
+        "label { color: #e6e6e6; }\n"
+        ".panel { background-color: #262b33; border-radius: 8px; }\n"
+        ".title { font-size: 20px; font-weight: bold; }\n"
+        ".subtle { color: #9aa4b2; font-size: 11px; }\n"
+        ".heading { font-weight: bold; color: #c7d0dd; }\n"
+
+        /* Tabs: dark strip, dim labels, bright label on the active tab. */
+        "notebook header { background-color: #262b33; border-color: #39404a; }\n"
+        "notebook tab { background-color: transparent; padding: 6px 16px; }\n"
+        "notebook tab label { color: #9aa4b2; }\n"
+        "notebook tab:checked { background-color: #2f3640; }\n"
+        "notebook tab:checked label { color: #ffffff; font-weight: bold; }\n"
+
+        /* Controls, which would otherwise stay light-themed. */
+        "button { background-image: none; background-color: #39404a;\n"
+        "         color: #e6e6e6; border: 1px solid #4a525e; padding: 4px 14px; }\n"
+        "button:hover { background-color: #47505c; }\n"
+        "button:disabled { color: #6b7480; }\n"
+        "entry { background-image: none; background-color: #2b313a;\n"
+        "        color: #e6e6e6; border: 1px solid #4a525e; }\n"
+        "entry image, entry placeholder { color: #8b94a1; }\n"
+        "combobox button { padding: 4px 8px; }\n"
+
+        /* Stat bars, coloured by how good the stat is. */
+        "progressbar trough { min-height: 10px; background-color: #39404a; }\n"
+        "progressbar progress { min-height: 10px; }\n"
+        "progressbar.s-low  progress { background-color: #e05a4f; }\n"
+        "progressbar.s-mid  progress { background-color: #e8a33d; }\n"
+        "progressbar.s-high progress { background-color: #9bd14f; }\n"
+        "progressbar.s-max  progress { background-color: #3fb950; }\n"
+
+        "treeview { background-color: #262b33; color: #e6e6e6; }\n"
+        "treeview:selected { background-color: #3d6fb5; color: #ffffff; }\n"
+        "treeview header button { background-color: #2f3640; color: #9aa4b2;\n"
+        "                         border: 0; padding: 4px; }\n"
+        "scrollbar { background-color: #262b33; }\n"
+        "separator { background-color: #39404a; }\n";
+
+    GtkCssProvider *provider = gtk_css_provider_new();
+    gtk_css_provider_load_from_data(provider, css, -1, NULL);
+    gtk_style_context_add_provider_for_screen(
+        gdk_screen_get_default(), GTK_STYLE_PROVIDER(provider),
+        GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
+    g_object_unref(provider);
 }
 
 /*
- * Both CSVs begin with a UTF-8 byte-order mark (EF BB BF). Left in place it
- * becomes part of the very first field, so the header "Dex" does not compare
- * equal to "Dex" and the file looks corrupt for no visible reason.
+ * A coloured "pill" for a type, built with Pango markup rather than CSS
+ * classes. Markup is far less fiddly here: the colour changes with every
+ * selection, and swapping style classes on a label each time would mean
+ * removing the old one first, which is easy to get wrong.
  */
-static void skip_bom(FILE *f)
+static void append_type_badge(GString *out, int type)
 {
-    int a = fgetc(f);
-    int b = fgetc(f);
-    int c = fgetc(f);
-    if (a == 0xEF && b == 0xBB && c == 0xBF) {
-        return;                 /* BOM consumed, carry on */
+    if (type == TYPE_NONE) {
+        return;
     }
-    rewind(f);
+    g_string_append_printf(
+        out, "<span background=\"%s\" foreground=\"#12151a\" size=\"small\">"
+             "  %s  </span>  ",
+        TYPE_COLOURS[type], TYPE_NAMES[type]);
+}
+
+/* Colour a stat bar by how good the stat is, and fill it proportionally. */
+static void set_stat_bar(GtkWidget *bar, int value)
+{
+    GtkStyleContext *ctx = gtk_widget_get_style_context(bar);
+    gtk_style_context_remove_class(ctx, "s-low");
+    gtk_style_context_remove_class(ctx, "s-mid");
+    gtk_style_context_remove_class(ctx, "s-high");
+    gtk_style_context_remove_class(ctx, "s-max");
+
+    const char *class_name = "s-max";
+    if (value < 60) {
+        class_name = "s-low";
+    } else if (value < 90) {
+        class_name = "s-mid";
+    } else if (value < 120) {
+        class_name = "s-high";
+    }
+    gtk_style_context_add_class(ctx, class_name);
+
+    gtk_progress_bar_set_fraction(GTK_PROGRESS_BAR(bar),
+                                  (double)value / MAX_SINGLE_STAT);
+}
+
+/* ------------------------------------------------------------------ *
+ * Filtering
+ * ------------------------------------------------------------------ */
+
+/*
+ * Called by GTK for every row to decide whether it should be shown. Note it
+ * receives the *underlying* store and an iter into it, which is why the
+ * hidden COL_INDEX is so useful: one integer gets us straight back to the
+ * real Pokemon without copying any strings.
+ */
+static gboolean row_visible(GtkTreeModel *model, GtkTreeIter *iter, gpointer data)
+{
+    AppState *state = data;
+
+    int index = -1;
+    gtk_tree_model_get(model, iter, COL_INDEX, &index, -1);
+    if (index < 0 || index >= state->count) {
+        return FALSE;
+    }
+    const Pokemon *p = &state->roster[index];
+
+    if (state->type_filter != TYPE_NONE &&
+        p->type1 != state->type_filter && p->type2 != state->type_filter) {
+        return FALSE;
+    }
+
+    if (state->search_text[0] != '\0') {
+        char lowered[NAME_LEN];
+        snprintf(lowered, sizeof lowered, "%s", p->name);
+        for (char *c = lowered; *c != '\0'; c++) {
+            *c = (char)g_ascii_tolower(*c);
+        }
+        if (strstr(lowered, state->search_text) == NULL) {
+            return FALSE;
+        }
+    }
+
+    return TRUE;
+}
+
+static void update_count_label(AppState *state)
+{
+    int visible = gtk_tree_model_iter_n_children(state->filter, NULL);
+    char text[128];
+    if (visible == state->count) {
+        snprintf(text, sizeof text, "%d species", state->count);
+    } else {
+        snprintf(text, sizeof text, "%d of %d species", visible, state->count);
+    }
+    gtk_label_set_text(GTK_LABEL(state->count_label), text);
+}
+
+static void on_search_changed(GtkSearchEntry *entry, gpointer data)
+{
+    AppState   *state = data;
+    const char *text  = gtk_entry_get_text(GTK_ENTRY(entry));
+
+    snprintf(state->search_text, sizeof state->search_text, "%s", text);
+    for (char *c = state->search_text; *c != '\0'; c++) {
+        *c = (char)g_ascii_tolower(*c);
+    }
+
+    gtk_tree_model_filter_refilter(GTK_TREE_MODEL_FILTER(state->filter));
+    update_count_label(state);
+}
+
+static void on_type_changed(GtkComboBox *combo, gpointer data)
+{
+    AppState *state = data;
+    int       active = gtk_combo_box_get_active(combo);
+
+    /* Row 0 is "All types", so every real type sits one row further down. */
+    state->type_filter = (active <= 0) ? TYPE_NONE : active - 1;
+
+    gtk_tree_model_filter_refilter(GTK_TREE_MODEL_FILTER(state->filter));
+    update_count_label(state);
+}
+
+static void on_clear_clicked(GtkButton *button, gpointer data)
+{
+    (void)button;
+    AppState *state = data;
+    gtk_entry_set_text(GTK_ENTRY(state->search), "");
+    gtk_combo_box_set_active(GTK_COMBO_BOX(state->type_combo), 0);
+}
+
+/* ------------------------------------------------------------------ *
+ * Detail panel
+ * ------------------------------------------------------------------ */
+
+static void show_pokemon(AppState *state, const Pokemon *p)
+{
+    gtk_label_set_text(GTK_LABEL(state->detail_name), p->name);
+
+    GString *types = g_string_new(NULL);
+    append_type_badge(types, p->type1);
+    append_type_badge(types, p->type2);
+    gtk_label_set_markup(GTK_LABEL(state->detail_types), types->str);
+    g_string_free(types, TRUE);
+
+    char total[64];
+    snprintf(total, sizeof total, "Base stat total  %d", p->total);
+    gtk_label_set_text(GTK_LABEL(state->detail_total), total);
+
+    int stats[6];
+    get_stats(p, stats);
+    for (int i = 0; i < 6; i++) {
+        char value[16];
+        snprintf(value, sizeof value, "%d", stats[i]);
+        gtk_label_set_text(GTK_LABEL(state->stat_value[i]), value);
+        set_stat_bar(state->stat_bar[i], stats[i]);
+    }
+
+    /*
+     * What this Pokemon is weak to, resists, or ignores entirely -- computed
+     * live from the type chart rather than stored anywhere. This is the first
+     * thing in the project that actually *uses* the chart for something a
+     * person would want to know.
+     */
+    GString *weak   = g_string_new(NULL);
+    GString *resist = g_string_new(NULL);
+    GString *immune = g_string_new(NULL);
+
+    for (int t = 0; t < TYPE_COUNT; t++) {
+        double multiplier = effectiveness(state->chart, t, p);
+        if (multiplier == 0.0) {
+            append_type_badge(immune, t);
+        } else if (multiplier > 1.0) {
+            append_type_badge(weak, t);
+            if (multiplier == 4.0) {
+                g_string_append(weak, "<span foreground=\"#e05a4f\">4x</span>  ");
+            }
+        } else if (multiplier < 1.0) {
+            append_type_badge(resist, t);
+            if (multiplier == 0.25) {
+                g_string_append(resist, "<span foreground=\"#9bd14f\">1/4</span>  ");
+            }
+        }
+    }
+
+    gtk_label_set_markup(GTK_LABEL(state->weak_label),
+                         weak->len   ? weak->str   : "<span foreground=\"#9aa4b2\">nothing</span>");
+    gtk_label_set_markup(GTK_LABEL(state->resist_label),
+                         resist->len ? resist->str : "<span foreground=\"#9aa4b2\">nothing</span>");
+    gtk_label_set_markup(GTK_LABEL(state->immune_label),
+                         immune->len ? immune->str : "<span foreground=\"#9aa4b2\">nothing</span>");
+
+    g_string_free(weak, TRUE);
+    g_string_free(resist, TRUE);
+    g_string_free(immune, TRUE);
+
+    gtk_list_store_clear(state->move_store);
+    for (int m = 0; m < p->move_count; m++) {
+        GtkTreeIter iter;
+        gtk_list_store_append(state->move_store, &iter);
+        gtk_list_store_set(state->move_store, &iter,
+                           MOVE_COL_LEVEL, p->moves[m].level,
+                           MOVE_COL_NAME,  p->moves[m].name,
+                           -1);
+    }
+
+    char moves[96];
+    if (p->move_count == 1) {
+        /* Worth calling out: these are the species that can never win. */
+        snprintf(moves, sizeof moves, "1 level-up move -- this one cannot win a fight");
+    } else {
+        snprintf(moves, sizeof moves, "%d level-up moves", p->move_count);
+    }
+    gtk_label_set_text(GTK_LABEL(state->move_count_label), moves);
+
+    gtk_stack_set_visible_child_name(GTK_STACK(state->detail_stack), "details");
+}
+
+static void on_selection_changed(GtkTreeSelection *selection, gpointer data)
+{
+    AppState     *state = data;
+    GtkTreeModel *model = NULL;
+    GtkTreeIter   iter;
+
+    if (!gtk_tree_selection_get_selected(selection, &model, &iter)) {
+        gtk_stack_set_visible_child_name(GTK_STACK(state->detail_stack), "empty");
+        return;
+    }
+
+    int index = -1;
+    gtk_tree_model_get(model, &iter, COL_INDEX, &index, -1);
+    if (index >= 0 && index < state->count) {
+        show_pokemon(state, &state->roster[index]);
+    }
+}
+
+/* ------------------------------------------------------------------ *
+ * Building the window
+ * ------------------------------------------------------------------ */
+
+static GtkWidget *make_stat_row(AppState *state, GtkWidget *grid, int row)
+{
+    GtkWidget *name = gtk_label_new(STAT_NAMES[row]);
+    gtk_label_set_xalign(GTK_LABEL(name), 0.0);
+    gtk_widget_set_size_request(name, 70, -1);
+    gtk_grid_attach(GTK_GRID(grid), name, 0, row, 1, 1);
+
+    GtkWidget *bar = gtk_progress_bar_new();
+    gtk_widget_set_hexpand(bar, TRUE);
+    gtk_widget_set_valign(bar, GTK_ALIGN_CENTER);
+    gtk_grid_attach(GTK_GRID(grid), bar, 1, row, 1, 1);
+    state->stat_bar[row] = bar;
+
+    GtkWidget *value = gtk_label_new("0");
+    gtk_label_set_xalign(GTK_LABEL(value), 1.0);
+    gtk_widget_set_size_request(value, 40, -1);
+    gtk_grid_attach(GTK_GRID(grid), value, 2, row, 1, 1);
+    state->stat_value[row] = value;
+
+    return bar;
+}
+
+/* One labelled row of coloured type pills in the matchup section. */
+static GtkWidget *make_matchup_row(GtkWidget *box, const char *heading)
+{
+    GtkWidget *title = gtk_label_new(heading);
+    gtk_label_set_xalign(GTK_LABEL(title), 0.0);
+    gtk_style_context_add_class(gtk_widget_get_style_context(title), "heading");
+    gtk_box_pack_start(GTK_BOX(box), title, FALSE, FALSE, 0);
+
+    GtkWidget *value = gtk_label_new("");
+    gtk_label_set_xalign(GTK_LABEL(value), 0.0);
+    gtk_label_set_line_wrap(GTK_LABEL(value), TRUE);
+    gtk_label_set_max_width_chars(GTK_LABEL(value), 30);
+    gtk_box_pack_start(GTK_BOX(box), value, FALSE, FALSE, 0);
+
+    return value;
 }
 
 /*
- * Split `line` on commas, in place, storing pointers in `fields`.
- * Returns the number of fields, or -1 if there were more than `max`.
- *
- * This deliberately does not use strtok(): strtok treats a run of delimiters
- * as one, so ",," would collapse and every column after an empty field would
- * shift left by one. Type2 is empty for 499 of the 1025 species, so that bug
- * would mis-type roughly half the roster while looking like it worked.
+ * Columns are given explicit fixed widths rather than being left to size
+ * themselves. Auto-sized columns take as much width as their widest cell
+ * needs, which makes the whole table's minimum width larger than the window
+ * and quietly shoves the detail panel off the right-hand edge.
  */
-static int split_csv(char *line, char *fields[], int max)
+static void add_column(GtkWidget *tree, const char *title, int column,
+                       int width, gboolean right_align)
 {
-    if (max <= 0) {
-        return -1;
+    GtkCellRenderer *renderer = gtk_cell_renderer_text_new();
+    if (right_align) {
+        g_object_set(renderer, "xalign", 1.0, NULL);
     }
-    int n = 0;
-    fields[n++] = line;
-    for (char *c = line; *c != '\0'; c++) {
-        if (*c == ',') {
-            *c = '\0';
-            if (n >= max) {
-                return -1;
-            }
-            fields[n++] = c + 1;
-        }
-    }
-    return n;
+    GtkTreeViewColumn *col = gtk_tree_view_column_new_with_attributes(
+        title, renderer, "text", column, NULL);
+    gtk_tree_view_column_set_sizing(col, GTK_TREE_VIEW_COLUMN_FIXED);
+    gtk_tree_view_column_set_fixed_width(col, width);
+    gtk_tree_view_column_set_sort_column_id(col, column);
+    gtk_tree_view_column_set_resizable(col, TRUE);
+    gtk_tree_view_append_column(GTK_TREE_VIEW(tree), col);
 }
 
-static int type_index(const char *name)
+static void add_number_column(GtkWidget *tree, const char *title, int column)
 {
-    for (int i = 0; i < TYPE_COUNT; i++) {
-        if (strcmp(TYPE_NAMES[i], name) == 0) {
-            return i;
-        }
-    }
-    return TYPE_NONE;
+    add_column(tree, title, column, 64, TRUE);
 }
 
-static const char *type_name(int index)
+static void add_text_column(GtkWidget *tree, const char *title, int column)
 {
-    if (index < 0 || index >= TYPE_COUNT) {
-        return "-";
-    }
-    return TYPE_NAMES[index];
+    add_column(tree, title, column, 110, FALSE);
 }
 
-/* Parse a whole number, rejecting empty strings and trailing rubbish. */
-static int parse_int(const char *s, int *out)
+/* The Pokedex page: filters on top, table on the left, details on the right. */
+static GtkWidget *build_dex_page(AppState *state)
 {
-    if (s == NULL || *s == '\0') {
-        return 0;
+    GtkWidget *page = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
+    gtk_container_set_border_width(GTK_CONTAINER(page), 10);
+
+    /* --- filter bar --- */
+    GtkWidget *bar = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    gtk_box_pack_start(GTK_BOX(page), bar, FALSE, FALSE, 0);
+
+    state->search = gtk_search_entry_new();
+    gtk_entry_set_placeholder_text(GTK_ENTRY(state->search), "Search by name...");
+    gtk_widget_set_hexpand(state->search, TRUE);
+    gtk_box_pack_start(GTK_BOX(bar), state->search, TRUE, TRUE, 0);
+
+    state->type_combo = gtk_combo_box_text_new();
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(state->type_combo), "All types");
+    for (int t = 0; t < TYPE_COUNT; t++) {
+        gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(state->type_combo),
+                                       TYPE_NAMES[t]);
     }
-    char *end = NULL;
-    long value = strtol(s, &end, 10);
-    if (end == s || *end != '\0') {
-        return 0;
+    gtk_combo_box_set_active(GTK_COMBO_BOX(state->type_combo), 0);
+    gtk_box_pack_start(GTK_BOX(bar), state->type_combo, FALSE, FALSE, 0);
+
+    GtkWidget *clear = gtk_button_new_with_label("Clear");
+    gtk_box_pack_start(GTK_BOX(bar), clear, FALSE, FALSE, 0);
+
+    state->count_label = gtk_label_new("");
+    gtk_style_context_add_class(gtk_widget_get_style_context(state->count_label),
+                                "subtle");
+    gtk_box_pack_start(GTK_BOX(bar), state->count_label, FALSE, FALSE, 6);
+
+    /* --- the table --- */
+    state->store = gtk_list_store_new(N_COLUMNS,
+                                      G_TYPE_INT,    G_TYPE_STRING,
+                                      G_TYPE_STRING, G_TYPE_STRING,
+                                      G_TYPE_INT, G_TYPE_INT, G_TYPE_INT,
+                                      G_TYPE_INT, G_TYPE_INT, G_TYPE_INT,
+                                      G_TYPE_INT, G_TYPE_INT);
+
+    for (int i = 0; i < state->count; i++) {
+        const Pokemon *p = &state->roster[i];
+        GtkTreeIter iter;
+        gtk_list_store_append(state->store, &iter);
+        gtk_list_store_set(state->store, &iter,
+                           COL_DEX,   p->dex,
+                           COL_NAME,  p->name,
+                           COL_TYPE1, type_name(p->type1),
+                           COL_TYPE2, (p->type2 == TYPE_NONE) ? "" : type_name(p->type2),
+                           COL_HP,    p->hp,
+                           COL_ATK,   p->attack,
+                           COL_DEF,   p->defense,
+                           COL_SPA,   p->sp_atk,
+                           COL_SPD,   p->sp_def,
+                           COL_SPE,   p->speed,
+                           COL_TOTAL, p->total,
+                           COL_INDEX, i,
+                           -1);
     }
-    *out = (int)value;
-    return 1;
+
+    /*
+     * Three models stacked on top of each other, which is the standard GTK
+     * arrangement: the store holds every row, the filter hides the ones that
+     * do not match, and the sort reorders what is left. The view only ever
+     * talks to the top of the stack.
+     */
+    state->filter = gtk_tree_model_filter_new(GTK_TREE_MODEL(state->store), NULL);
+    gtk_tree_model_filter_set_visible_func(GTK_TREE_MODEL_FILTER(state->filter),
+                                           row_visible, state, NULL);
+
+    GtkTreeModel *sorted = gtk_tree_model_sort_new_with_model(state->filter);
+    state->tree = gtk_tree_view_new_with_model(sorted);
+
+    /*
+     * Do NOT turn on gtk_tree_view_set_fixed_height_mode() here. It is only
+     * legal when every column has been set to GTK_TREE_VIEW_COLUMN_FIXED
+     * sizing; with the default sizing the rows end up zero pixels tall and
+     * the table renders as an empty black rectangle, with no warning at all.
+     * At 1025 rows the default mode is plenty fast, so there is nothing to
+     * gain by risking it.
+     */
+
+    /* 50 + 124 + 76 + 76 + 7*64 = 774, just inside TABLE_WIDTH. */
+    add_column(state->tree, "#",    COL_DEX,   50,  TRUE);
+    add_column(state->tree, "Name", COL_NAME,  124, FALSE);
+    add_column(state->tree, "Type", COL_TYPE1, 76,  FALSE);
+    add_column(state->tree, "",     COL_TYPE2, 76,  FALSE);
+    add_number_column(state->tree, "HP",    COL_HP);
+    add_number_column(state->tree, "Atk",   COL_ATK);
+    add_number_column(state->tree, "Def",   COL_DEF);
+    add_number_column(state->tree, "SpA",   COL_SPA);
+    add_number_column(state->tree, "SpD",   COL_SPD);
+    add_number_column(state->tree, "Spe",   COL_SPE);
+    add_number_column(state->tree, "Total", COL_TOTAL);
+
+    GtkWidget *scroll = gtk_scrolled_window_new(NULL, NULL);
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scroll),
+                                   GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
+    gtk_container_add(GTK_CONTAINER(scroll), state->tree);
+    gtk_widget_set_size_request(scroll, TABLE_WIDTH, -1);
+
+    /* --- detail panel --- */
+    GtkWidget *details = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
+    gtk_container_set_border_width(GTK_CONTAINER(details), 12);
+    gtk_style_context_add_class(gtk_widget_get_style_context(details), "panel");
+
+    state->detail_name = gtk_label_new("");
+    gtk_label_set_xalign(GTK_LABEL(state->detail_name), 0.0);
+    gtk_style_context_add_class(gtk_widget_get_style_context(state->detail_name),
+                                "title");
+    gtk_box_pack_start(GTK_BOX(details), state->detail_name, FALSE, FALSE, 0);
+
+    state->detail_types = gtk_label_new("");
+    gtk_label_set_xalign(GTK_LABEL(state->detail_types), 0.0);
+    gtk_box_pack_start(GTK_BOX(details), state->detail_types, FALSE, FALSE, 0);
+
+    state->detail_total = gtk_label_new("");
+    gtk_label_set_xalign(GTK_LABEL(state->detail_total), 0.0);
+    gtk_style_context_add_class(gtk_widget_get_style_context(state->detail_total),
+                                "heading");
+    gtk_box_pack_start(GTK_BOX(details), state->detail_total, FALSE, FALSE, 0);
+
+    GtkWidget *stat_grid = gtk_grid_new();
+    gtk_grid_set_row_spacing(GTK_GRID(stat_grid), 4);
+    gtk_grid_set_column_spacing(GTK_GRID(stat_grid), 8);
+    for (int i = 0; i < 6; i++) {
+        make_stat_row(state, stat_grid, i);
+    }
+    gtk_box_pack_start(GTK_BOX(details), stat_grid, FALSE, FALSE, 0);
+
+    gtk_box_pack_start(GTK_BOX(details),
+                       gtk_separator_new(GTK_ORIENTATION_HORIZONTAL),
+                       FALSE, FALSE, 4);
+
+    state->weak_label   = make_matchup_row(details, "Weak to");
+    state->resist_label = make_matchup_row(details, "Resists");
+    state->immune_label = make_matchup_row(details, "Immune to");
+
+    gtk_box_pack_start(GTK_BOX(details),
+                       gtk_separator_new(GTK_ORIENTATION_HORIZONTAL),
+                       FALSE, FALSE, 4);
+
+    state->move_count_label = gtk_label_new("");
+    gtk_label_set_xalign(GTK_LABEL(state->move_count_label), 0.0);
+    gtk_style_context_add_class(
+        gtk_widget_get_style_context(state->move_count_label), "heading");
+    gtk_box_pack_start(GTK_BOX(details), state->move_count_label, FALSE, FALSE, 0);
+
+    state->move_store = gtk_list_store_new(MOVE_N_COLUMNS,
+                                           G_TYPE_INT, G_TYPE_STRING);
+    GtkWidget *move_tree = gtk_tree_view_new_with_model(
+        GTK_TREE_MODEL(state->move_store));
+    add_number_column(move_tree, "Lv",   MOVE_COL_LEVEL);
+    add_text_column(move_tree,   "Move", MOVE_COL_NAME);
+
+    GtkWidget *move_scroll = gtk_scrolled_window_new(NULL, NULL);
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(move_scroll),
+                                   GTK_POLICY_NEVER, GTK_POLICY_AUTOMATIC);
+    gtk_container_add(GTK_CONTAINER(move_scroll), move_tree);
+    gtk_widget_set_vexpand(move_scroll, TRUE);
+    gtk_box_pack_start(GTK_BOX(details), move_scroll, TRUE, TRUE, 0);
+
+    /*
+     * A GtkStack shows one child at a time. Here it swaps between the "pick
+     * something" message and the real details, which is tidier than building
+     * and destroying the panel on every selection.
+     */
+    GtkWidget *placeholder = gtk_label_new("Select a Pokemon to see its details.");
+    gtk_style_context_add_class(gtk_widget_get_style_context(placeholder), "subtle");
+
+    state->detail_stack = gtk_stack_new();
+    gtk_stack_add_named(GTK_STACK(state->detail_stack), placeholder, "empty");
+    gtk_stack_add_named(GTK_STACK(state->detail_stack), details, "details");
+    gtk_stack_set_visible_child_name(GTK_STACK(state->detail_stack), "empty");
+    gtk_widget_set_size_request(state->detail_stack, PANEL_WIDTH, -1);
+
+    /*
+     * A plain box rather than a GtkPaned. A paned negotiates its divider from
+     * the two children's natural sizes, and the table's natural width is the
+     * sum of all its columns -- which is wider than the window, so the panel
+     * got squeezed to nothing. pack_end gives the panel its width first and
+     * lets the table have whatever is left, which is predictable at any
+     * window size. The cost is losing the draggable divider.
+     */
+    GtkWidget *split = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 10);
+    gtk_box_pack_start(GTK_BOX(split), scroll, TRUE, TRUE, 0);
+    gtk_box_pack_end(GTK_BOX(split), state->detail_stack, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(page), split, TRUE, TRUE, 0);
+
+    /* --- wiring --- */
+    g_signal_connect(state->search, "search-changed",
+                     G_CALLBACK(on_search_changed), state);
+    g_signal_connect(state->type_combo, "changed",
+                     G_CALLBACK(on_type_changed), state);
+    g_signal_connect(clear, "clicked", G_CALLBACK(on_clear_clicked), state);
+    g_signal_connect(gtk_tree_view_get_selection(GTK_TREE_VIEW(state->tree)),
+                     "changed", G_CALLBACK(on_selection_changed), state);
+
+    update_count_label(state);
+    return page;
 }
 
-/* ------------------------------------------------------------------ *
- * Move list:  "Tackle (Lv 1); Growl (Lv 1); Vine Whip (Lv 3)"
- * ------------------------------------------------------------------ */
-
-static int parse_moves(char *field, Pokemon *p, int line_no)
+/* The full 18x18 grid, built once. Colour makes the shape of it readable. */
+static GtkWidget *build_chart_page(AppState *state)
 {
-    p->move_count = 0;
+    GtkWidget *grid = gtk_grid_new();
+    gtk_grid_set_row_spacing(GTK_GRID(grid), 2);
+    gtk_grid_set_column_spacing(GTK_GRID(grid), 2);
+    gtk_container_set_border_width(GTK_CONTAINER(grid), 10);
 
-    char *entry = field;
-    while (entry != NULL && *entry != '\0') {
-        char *semicolon = strchr(entry, ';');
-        if (semicolon != NULL) {
-            *semicolon = '\0';
-        }
-        trim(entry);
+    GtkWidget *corner = gtk_label_new("atk \\ def");
+    gtk_style_context_add_class(gtk_widget_get_style_context(corner), "subtle");
+    gtk_grid_attach(GTK_GRID(grid), corner, 0, 0, 1, 1);
 
-        if (*entry != '\0') {
-            if (p->move_count >= MAX_MOVES) {
-                fprintf(stderr, "line %d: %s has more than %d moves\n",
-                        line_no, p->name, MAX_MOVES);
-                return 0;
+    for (int t = 0; t < TYPE_COUNT; t++) {
+        GString *markup = g_string_new(NULL);
+
+        /* Column headings across the top. */
+        g_string_printf(markup,
+                        "<span foreground=\"%s\" size=\"small\">%.3s</span>",
+                        TYPE_COLOURS[t], TYPE_NAMES[t]);
+        GtkWidget *top = gtk_label_new(NULL);
+        gtk_label_set_markup(GTK_LABEL(top), markup->str);
+        gtk_widget_set_size_request(top, 34, -1);
+        gtk_grid_attach(GTK_GRID(grid), top, t + 1, 0, 1, 1);
+
+        /* Row headings down the side. */
+        g_string_printf(markup, "<span foreground=\"%s\">%s</span>",
+                        TYPE_COLOURS[t], TYPE_NAMES[t]);
+        GtkWidget *side = gtk_label_new(NULL);
+        gtk_label_set_markup(GTK_LABEL(side), markup->str);
+        gtk_label_set_xalign(GTK_LABEL(side), 1.0);
+        gtk_grid_attach(GTK_GRID(grid), side, 0, t + 1, 1, 1);
+
+        g_string_free(markup, TRUE);
+    }
+
+    for (int atk = 0; atk < TYPE_COUNT; atk++) {
+        for (int def = 0; def < TYPE_COUNT; def++) {
+            double value = state->chart[atk][def];
+
+            const char *background = "#2b313a";
+            const char *text       = "#5d6875";
+            const char *label      = "";
+            if (value == 0.0) {
+                background = "#3a2326"; text = "#e05a4f"; label = "0";
+            } else if (value == 0.5) {
+                background = "#33272a"; text = "#d98b83"; label = "\302\275";
+            } else if (value == 2.0) {
+                background = "#24372a"; text = "#7ddc8c"; label = "2";
             }
 
-            /* No move name contains '(', so the last one opens "(Lv N)". */
-            char  *open      = strrchr(entry, '(');
-            size_t entry_len = strlen(entry);
-            if (open == NULL || entry_len == 0 || entry[entry_len - 1] != ')') {
-                fprintf(stderr, "line %d: malformed move entry \"%s\"\n",
-                        line_no, entry);
-                return 0;
-            }
+            GString *markup = g_string_new(NULL);
+            g_string_printf(markup,
+                            "<span background=\"%s\" foreground=\"%s\">"
+                            "   %s   </span>", background, text, label);
+            GtkWidget *cell = gtk_label_new(NULL);
+            gtk_label_set_markup(GTK_LABEL(cell), markup->str);
+            g_string_free(markup, TRUE);
 
-            int level = 0;
-            if (sscanf(open, "(Lv %d)", &level) != 1 || level < 0 || level > 100) {
-                fprintf(stderr, "line %d: bad level in move entry \"%s\"\n",
-                        line_no, entry);
-                return 0;
-            }
-
-            *open = '\0';       /* cut the "(Lv N)" off, leaving the name */
-            trim(entry);
-
-            if (*entry == '\0' || strlen(entry) >= MOVE_NAME_LEN) {
-                fprintf(stderr,
-                        "line %d: move name \"%s\" is empty or too long "
-                        "(max %d bytes)\n",
-                        line_no, entry, MOVE_NAME_LEN - 1);
-                return 0;
-            }
-
-            Move *m = &p->moves[p->move_count++];
-            snprintf(m->name, sizeof m->name, "%s", entry);
-            m->level = level;
-        }
-
-        entry = (semicolon != NULL) ? semicolon + 1 : NULL;
-    }
-
-    return 1;
-}
-
-/* ------------------------------------------------------------------ *
- * Roster loader
- * ------------------------------------------------------------------ */
-
-static int load_roster(const char *path, Pokemon *roster, int *count)
-{
-    FILE *f = fopen(path, "rb");
-    if (f == NULL) {
-        fprintf(stderr, "Cannot open roster file: %s\n", path);
-        return 0;
-    }
-    skip_bom(f);
-
-    char  line[LINE_LEN];
-    char *fields[FIELD_COUNT];
-    int   line_no = 0;
-    int   n       = 0;
-
-    /* Header */
-    if (fgets(line, sizeof line, f) == NULL) {
-        fprintf(stderr, "%s is empty\n", path);
-        fclose(f);
-        return 0;
-    }
-    line_no++;
-    trim(line);
-    if (split_csv(line, fields, FIELD_COUNT) != FIELD_COUNT ||
-        strcmp(fields[0], "Dex") != 0 || strcmp(fields[1], "Name") != 0) {
-        fprintf(stderr, "%s: unexpected header row\n", path);
-        fclose(f);
-        return 0;
-    }
-
-    while (fgets(line, sizeof line, f) != NULL) {
-        line_no++;
-
-        /* A truncated line means LINE_LEN is too small -- say so, don't guess. */
-        size_t len = strlen(line);
-        if (len == sizeof line - 1 && line[len - 1] != '\n') {
-            fprintf(stderr, "line %d: longer than %d bytes -- raise LINE_LEN\n",
-                    line_no, LINE_LEN);
-            fclose(f);
-            return 0;
-        }
-
-        trim(line);
-        if (*line == '\0') {
-            continue;           /* tolerate a blank final line */
-        }
-
-        if (n >= MAX_POKEMON) {
-            fprintf(stderr, "line %d: more than %d species -- raise MAX_POKEMON\n",
-                    line_no, MAX_POKEMON);
-            fclose(f);
-            return 0;
-        }
-
-        int got = split_csv(line, fields, FIELD_COUNT);
-        if (got != FIELD_COUNT) {
-            fprintf(stderr, "line %d: expected %d columns, found %d\n",
-                    line_no, FIELD_COUNT, got);
-            fclose(f);
-            return 0;
-        }
-        for (int i = 0; i < FIELD_COUNT; i++) {
-            trim(fields[i]);
-        }
-
-        Pokemon *p = &roster[n];
-        memset(p, 0, sizeof *p);
-
-        if (!parse_int(fields[0], &p->dex)) {
-            fprintf(stderr, "line %d: bad dex number \"%s\"\n", line_no, fields[0]);
-            fclose(f);
-            return 0;
-        }
-        if (p->dex != n + 1) {
-            fprintf(stderr,
-                    "line %d: dex numbers are not contiguous "
-                    "(expected %d, found %d)\n",
-                    line_no, n + 1, p->dex);
-            fclose(f);
-            return 0;
-        }
-
-        if (*fields[1] == '\0' || strlen(fields[1]) >= NAME_LEN) {
-            fprintf(stderr,
-                    "line %d: name \"%s\" is empty or too long (max %d bytes)\n",
-                    line_no, fields[1], NAME_LEN - 1);
-            fclose(f);
-            return 0;
-        }
-        snprintf(p->name, sizeof p->name, "%s", fields[1]);
-
-        p->type1 = type_index(fields[2]);
-        if (p->type1 == TYPE_NONE) {
-            fprintf(stderr, "line %d: %s has unknown type \"%s\"\n",
-                    line_no, p->name, fields[2]);
-            fclose(f);
-            return 0;
-        }
-        /* An empty second type is normal; a non-empty unknown one is not. */
-        if (*fields[3] == '\0') {
-            p->type2 = TYPE_NONE;
-        } else {
-            p->type2 = type_index(fields[3]);
-            if (p->type2 == TYPE_NONE) {
-                fprintf(stderr, "line %d: %s has unknown second type \"%s\"\n",
-                        line_no, p->name, fields[3]);
-                fclose(f);
-                return 0;
-            }
-        }
-
-        int *stats[6] = { &p->hp,     &p->attack, &p->defense,
-                          &p->sp_atk, &p->sp_def, &p->speed };
-        for (int i = 0; i < 6; i++) {
-            if (!parse_int(fields[4 + i], stats[i]) || *stats[i] < 1) {
-                fprintf(stderr, "line %d: %s has bad stat \"%s\"\n",
-                        line_no, p->name, fields[4 + i]);
-                fclose(f);
-                return 0;
-            }
-        }
-
-        if (!parse_int(fields[10], &p->total)) {
-            fprintf(stderr, "line %d: %s has bad total \"%s\"\n",
-                    line_no, p->name, fields[10]);
-            fclose(f);
-            return 0;
-        }
-
-        /*
-         * The checksum. Every row in the supplied file states a Total equal to
-         * the sum of its six stats, so a mismatch means the row was misparsed
-         * -- almost certainly a column shift. Fail loudly rather than quietly
-         * ranking nonsense.
-         */
-        if (p->total != stat_sum(p)) {
-            fprintf(stderr,
-                    "line %d: %s -- stated total %d but stats sum to %d "
-                    "(columns misaligned?)\n",
-                    line_no, p->name, p->total, stat_sum(p));
-            fclose(f);
-            return 0;
-        }
-
-        if (!parse_moves(fields[11], p, line_no)) {
-            fclose(f);
-            return 0;
-        }
-
-        n++;
-    }
-
-    fclose(f);
-    *count = n;
-    return 1;
-}
-
-/* ------------------------------------------------------------------ *
- * Type chart loader
- * ------------------------------------------------------------------ */
-
-static int load_type_chart(const char *path, double chart[TYPE_COUNT][TYPE_COUNT])
-{
-    FILE *f = fopen(path, "rb");
-    if (f == NULL) {
-        fprintf(stderr, "Cannot open type chart file: %s\n", path);
-        return 0;
-    }
-    skip_bom(f);
-
-    char  line[LINE_LEN];
-    char *fields[TYPE_COUNT + 1];
-
-    if (fgets(line, sizeof line, f) == NULL) {
-        fprintf(stderr, "%s is empty\n", path);
-        fclose(f);
-        return 0;
-    }
-    trim(line);
-    if (split_csv(line, fields, TYPE_COUNT + 1) != TYPE_COUNT + 1) {
-        fprintf(stderr, "%s: header should have %d columns\n",
-                path, TYPE_COUNT + 1);
-        fclose(f);
-        return 0;
-    }
-    /* Guard against a transposed or reordered chart. */
-    for (int i = 0; i < TYPE_COUNT; i++) {
-        trim(fields[i + 1]);
-        if (strcmp(fields[i + 1], TYPE_NAMES[i]) != 0) {
-            fprintf(stderr, "%s: column %d is \"%s\", expected \"%s\"\n",
-                    path, i + 1, fields[i + 1], TYPE_NAMES[i]);
-            fclose(f);
-            return 0;
+            gtk_grid_attach(GTK_GRID(grid), cell, def + 1, atk + 1, 1, 1);
         }
     }
 
-    for (int row = 0; row < TYPE_COUNT; row++) {
-        if (fgets(line, sizeof line, f) == NULL) {
-            fprintf(stderr, "%s: expected %d rows, found %d\n",
-                    path, TYPE_COUNT, row);
-            fclose(f);
-            return 0;
-        }
-        trim(line);
-        if (split_csv(line, fields, TYPE_COUNT + 1) != TYPE_COUNT + 1) {
-            fprintf(stderr, "%s: row %d should have %d columns\n",
-                    path, row + 1, TYPE_COUNT + 1);
-            fclose(f);
-            return 0;
-        }
-        trim(fields[0]);
-        if (strcmp(fields[0], TYPE_NAMES[row]) != 0) {
-            fprintf(stderr, "%s: row %d is \"%s\", expected \"%s\"\n",
-                    path, row + 1, fields[0], TYPE_NAMES[row]);
-            fclose(f);
-            return 0;
-        }
+    /* The grid is much narrower than the window, so centre it. */
+    gtk_widget_set_halign(grid, GTK_ALIGN_CENTER);
+    gtk_widget_set_valign(grid, GTK_ALIGN_START);
 
-        for (int col = 0; col < TYPE_COUNT; col++) {
-            trim(fields[col + 1]);
-            char  *end   = NULL;
-            double value = strtod(fields[col + 1], &end);
-            if (end == fields[col + 1] || *end != '\0') {
-                fprintf(stderr, "%s: bad multiplier \"%s\" at %s -> %s\n",
-                        path, fields[col + 1], TYPE_NAMES[row], TYPE_NAMES[col]);
-                fclose(f);
-                return 0;
-            }
-            if (value != 0.0 && value != 0.5 && value != 1.0 && value != 2.0) {
-                fprintf(stderr, "%s: unexpected multiplier %g at %s -> %s\n",
-                        path, value, TYPE_NAMES[row], TYPE_NAMES[col]);
-                fclose(f);
-                return 0;
-            }
-            chart[row][col] = value;
-        }
-    }
-
-    fclose(f);
-    return 1;
+    GtkWidget *scroll = gtk_scrolled_window_new(NULL, NULL);
+    gtk_container_add(GTK_CONTAINER(scroll), grid);
+    return scroll;
 }
 
 /*
- * Effectiveness of an attacking type against a (possibly dual-typed) defender.
- * Dual types multiply, which is why Charizard takes 4x from Rock.
+ * Select the first visible row. Must run after the window is shown -- see the
+ * note in activate().
  */
-static double effectiveness(double chart[TYPE_COUNT][TYPE_COUNT],
-                            int attack_type, const Pokemon *defender)
+static void select_first_row(AppState *state)
 {
-    double multiplier = chart[attack_type][defender->type1];
-    if (defender->type2 != TYPE_NONE) {
-        multiplier *= chart[attack_type][defender->type2];
+    GtkTreeModel *model = gtk_tree_view_get_model(GTK_TREE_VIEW(state->tree));
+    GtkTreeIter   first;
+    if (gtk_tree_model_get_iter_first(model, &first)) {
+        gtk_tree_selection_select_iter(
+            gtk_tree_view_get_selection(GTK_TREE_VIEW(state->tree)), &first);
     }
-    return multiplier;
+}
+
+static void activate(GtkApplication *app, gpointer data)
+{
+    AppState *state = data;
+
+    load_css();
+
+    GtkWidget *window = gtk_application_window_new(app);
+    gtk_window_set_title(GTK_WINDOW(window), "The Strongest Pokemon -- Pokedex");
+    gtk_window_set_default_size(GTK_WINDOW(window), WINDOW_WIDTH, WINDOW_HEIGHT);
+    gtk_widget_set_size_request(window, WINDOW_WIDTH, WINDOW_HEIGHT);
+    gtk_window_set_resizable(GTK_WINDOW(window), FALSE);
+    gtk_window_set_position(GTK_WINDOW(window), GTK_WIN_POS_CENTER);
+
+    GtkWidget *notebook = gtk_notebook_new();
+    gtk_notebook_append_page(GTK_NOTEBOOK(notebook), build_dex_page(state),
+                             gtk_label_new("Pokedex"));
+    gtk_notebook_append_page(GTK_NOTEBOOK(notebook), build_chart_page(state),
+                             gtk_label_new("Type chart"));
+    gtk_container_add(GTK_CONTAINER(window), notebook);
+
+    gtk_widget_show_all(window);
+
+    /*
+     * The first selection has to come after show_all(). A GtkStack settles on
+     * its visible child when its children are realised, so a selection made
+     * while building gets overwritten by the placeholder page -- which is why
+     * the panel used to say "select a Pokemon" with row 1 already highlighted.
+     */
+    select_first_row(state);
 }
 
 /* ------------------------------------------------------------------ *
- * Report
+ * Console report (unchanged from Stage 1)
  * ------------------------------------------------------------------ */
 
 static void print_pokemon(const Pokemon *p)
@@ -527,19 +829,10 @@ static void report(const Pokemon *roster, int count,
            total_moves, (double)total_moves / count, fewest, most);
     printf("  every row's stated Total matches the sum of its six stats\n");
 
-    printf("\n=== Samples ===\n");
-    print_pokemon(&roster[0]);          /* Bulbasaur:  dual-typed   */
-    print_pokemon(&roster[3]);          /* Charmander: single-typed */
-    print_pokemon(&roster[82]);         /* Farfetch'd: UTF-8 name   */
-    print_pokemon(&roster[668]);        /* Flabebe:    UTF-8 name   */
-    print_pokemon(&roster[count - 1]);  /* Pecharunt:  last row     */
-
     printf("\n=== Highest base stat total ===\n");
     print_pokemon(&roster[best]);
 
     printf("\n=== Species knowing only one move ===\n");
-    printf("  (these cannot win a fight, and two of them fight forever --\n");
-    printf("   this is why the battle loop will need a turn cap)\n");
     for (int i = 0; i < count; i++) {
         if (roster[i].move_count == 1) {
             printf("  #%-4d %-12s knows only %s\n",
@@ -548,17 +841,10 @@ static void report(const Pokemon *roster, int count,
     }
 
     printf("\n=== Type chart spot checks ===\n");
-    const Pokemon *charizard = &roster[5];
-    const Pokemon *gengar    = &roster[93];
-    printf("  Rock   -> %-10s (%s/%s) = %gx\n", charizard->name,
-           type_name(charizard->type1), type_name(charizard->type2),
-           effectiveness(chart, type_index("Rock"), charizard));
-    printf("  Water  -> %-10s (%s/%s) = %gx\n", charizard->name,
-           type_name(charizard->type1), type_name(charizard->type2),
-           effectiveness(chart, type_index("Water"), charizard));
-    printf("  Normal -> %-10s (%s/%s) = %gx\n", gengar->name,
-           type_name(gengar->type1), type_name(gengar->type2),
-           effectiveness(chart, type_index("Normal"), gengar));
+    printf("  Rock   -> Charizard (Fire/Flying)  = %gx\n",
+           effectiveness(chart, type_index("Rock"), &roster[5]));
+    printf("  Normal -> Gengar    (Ghost/Poison) = %gx\n",
+           effectiveness(chart, type_index("Normal"), &roster[93]));
 }
 
 /* ------------------------------------------------------------------ *
@@ -640,7 +926,6 @@ static int run_tests(const Pokemon *roster, int count,
     check(single_typed == 499, "499 species are single-typed");
     check(count - single_typed == 526, "526 species are dual-typed");
 
-    /* No duplicate names -- a name is the natural lookup key later. */
     int duplicates = 0;
     for (int i = 0; i < count; i++) {
         for (int j = i + 1; j < count; j++) {
@@ -666,7 +951,6 @@ static int run_tests(const Pokemon *roster, int count,
     check(strcmp(roster[668].name, "Flab\xc3\xa9" "b\xc3\xa9") == 0,
           "Flabebe keeps its accents");
 
-    /* The species that make a turn cap necessary. */
     check(roster[10].move_count == 1 &&
           strcmp(roster[10].moves[0].name, "Harden") == 0,
           "Metapod knows exactly one move, and it is Harden");
@@ -674,7 +958,6 @@ static int run_tests(const Pokemon *roster, int count,
           strcmp(roster[131].moves[0].name, "Transform") == 0,
           "Ditto knows exactly one move, and it is Transform");
 
-    /* Evolution moves are recorded as level 0, not dropped. */
     int lv0 = 0;
     for (int i = 0; i < count; i++) {
         for (int m = 0; m < roster[i].move_count; m++) {
@@ -685,7 +968,6 @@ static int run_tests(const Pokemon *roster, int count,
     }
     check(lv0 == 271, "271 moves are learned on evolution (Lv 0)");
 
-    /* Multi-word move names parsed whole, with their levels. */
     check(roster[0].move_count == 15, "Bulbasaur has 15 level-up moves");
     check(strcmp(roster[0].moves[2].name, "Vine Whip") == 0,
           "  a two-word move name survives intact");
@@ -702,10 +984,8 @@ static int run_tests(const Pokemon *roster, int count,
         }
     }
     check(values_ok, "every chart multiplier is 0, 0.5, 1 or 2");
-    check(chart[type_index("Fire")][type_index("Grass")] == 2.0,
-          "Fire beats Grass");
-    check(chart[type_index("Water")][type_index("Fire")] == 2.0,
-          "Water beats Fire");
+    check(chart[type_index("Fire")][type_index("Grass")] == 2.0, "Fire beats Grass");
+    check(chart[type_index("Water")][type_index("Fire")] == 2.0, "Water beats Fire");
     check(chart[type_index("Normal")][type_index("Ghost")] == 0.0,
           "Normal cannot hit Ghost");
     check(chart[type_index("Electric")][type_index("Ground")] == 0.0,
@@ -715,13 +995,22 @@ static int run_tests(const Pokemon *roster, int count,
     check(chart[type_index("Fighting")][type_index("Rock")] == 2.0,
           "Fighting beats Rock");
 
-    /* Dual types multiply. */
     check(effectiveness(chart, type_index("Rock"), &roster[5]) == 4.0,
           "Rock hits Charizard (Fire/Flying) for 4x");
     check(effectiveness(chart, type_index("Normal"), &roster[93]) == 0.0,
           "Normal hits Gengar (Ghost/Poison) for 0x");
     check(effectiveness(chart, type_index("Electric"), &roster[129]) == 4.0,
           "Electric hits Gyarados (Water/Flying) for 4x");
+
+    /* --- colour table must line up with the type table --- */
+    int colours_ok = 1;
+    for (int t = 0; t < TYPE_COUNT; t++) {
+        if (TYPE_COLOURS[t] == NULL || TYPE_COLOURS[t][0] != '#' ||
+            strlen(TYPE_COLOURS[t]) != 7) {
+            colours_ok = 0;
+        }
+    }
+    check(colours_ok, "all 18 type colours are present and well formed");
 
     printf("\n  %d checks, %d passed, %d failed\n",
            tests_run, tests_run - tests_failed, tests_failed);
@@ -738,7 +1027,8 @@ int main(int argc, char *argv[])
     /*
      * Without this the console uses the legacy code page and the UTF-8 names
      * (Nidoran, Flabebe, Farfetch'd) print as mojibake. The bytes in memory
-     * are correct either way; this only fixes what you see.
+     * are correct either way; this only fixes what you see. GTK does its own
+     * text handling, so this matters for --report and --test only.
      */
     SetConsoleOutputCP(CP_UTF8);
 #endif
@@ -746,11 +1036,14 @@ int main(int argc, char *argv[])
     const char *roster_path = "pokemon_1025_stats_types_moves.csv";
     const char *chart_path  = "type_chart_18x18.csv";
     int         testing     = 0;
+    int         reporting   = 0;
     int         paths_given = 0;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--test") == 0) {
             testing = 1;
+        } else if (strcmp(argv[i], "--report") == 0) {
+            reporting = 1;
         } else if (paths_given == 0) {
             roster_path = argv[i];
             paths_given++;
@@ -780,10 +1073,28 @@ int main(int argc, char *argv[])
     if (testing) {
         return run_tests(roster, count, chart) ? 0 : 1;
     }
+    if (reporting) {
+        printf("thestrongestpokemon -- data layer\n");
+        report(roster, count, chart);
+        return 0;
+    }
 
-    printf("thestrongestpokemon -- Stage 1: data layer\n");
-    printf("Loaded %s and %s\n", roster_path, chart_path);
-    report(roster, count, chart);
-    printf("\nRun with --test to check the loader.\n");
-    return 0;
+    static AppState state;
+    state.roster      = roster;
+    state.count       = count;
+    state.chart       = chart;
+    state.type_filter = TYPE_NONE;
+
+    GtkApplication *app = gtk_application_new("com.ricky.thestrongestpokemon",
+                                              G_APPLICATION_DEFAULT_FLAGS);
+    g_signal_connect(app, "activate", G_CALLBACK(activate), &state);
+
+    /*
+     * Our own flags are already handled above, so GTK is given no arguments
+     * at all -- otherwise it would reject --report and --test as unknown
+     * options before our code ever saw them.
+     */
+    int status = g_application_run(G_APPLICATION(app), 0, NULL);
+    g_object_unref(app);
+    return status;
 }

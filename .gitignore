@@ -1,0 +1,38 @@
+# ---- C build artifacts ----
+build/
+bin/
+obj/
+*.o
+*.obj
+*.exe
+*.dll
+*.so
+*.a
+*.lib
+*.out
+*.gch
+*.pch
+*.ilk
+*.pdb
+*.d
+
+# ---- Secrets / personal data ----
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+private/
+
+# ---- Editor ----
+.vs/
+.idea/
+*.swp
+*~
+
+# ---- OS junk ----
+Thumbs.db
+Desktop.ini
+desktop.ini
+.DS_Store
+~$*

@@ -39,6 +39,8 @@ enum {
     COL_DEX, COL_NAME, COL_TYPE1, COL_TYPE2,
     COL_HP, COL_ATK, COL_DEF, COL_SPA, COL_SPD, COL_SPE, COL_TOTAL,
     COL_INDEX,          /* index into roster[] -- hidden from the user */
+    COL_ICON,           /* 16x16 sprite; appended last so every column above
+                           keeps the number it already had */
     N_COLUMNS
 };
 
@@ -54,6 +56,10 @@ enum { MOVE_COL_LEVEL, MOVE_COL_NAME, MOVE_N_COLUMNS };
 #define WINDOW_HEIGHT   750
 #define PANEL_WIDTH     380
 #define TABLE_WIDTH     780
+
+/* Sprites: 1025 16x16 PNGs named NNNN_slug.png, one per dex number. */
+#define SPRITE_DIR    "sprites"
+#define SPRITE_LARGE   64      /* detail panel, scaled 4x from 16x16 */
 
 static const char *STAT_NAMES[6] = {
     "HP", "Attack", "Defense", "Sp. Atk", "Sp. Def", "Speed"
@@ -78,6 +84,7 @@ typedef struct {
 
     /* Detail panel */
     GtkWidget    *detail_stack;      /* swaps placeholder <-> details */
+    GtkWidget    *detail_sprite;
     GtkWidget    *detail_name;
     GtkWidget    *detail_types;
     GtkWidget    *detail_total;
@@ -98,6 +105,62 @@ static void get_stats(const Pokemon *p, int out[6])
 {
     out[0] = p->hp;     out[1] = p->attack; out[2] = p->defense;
     out[3] = p->sp_atk; out[4] = p->sp_def; out[5] = p->speed;
+}
+
+/* ------------------------------------------------------------------ *
+ * Sprites
+ * ------------------------------------------------------------------ */
+
+/*
+ * Sprite files are named NNNN_slug.png and we only know the dex number, not
+ * the slug -- so the directory is scanned once and the leading digits of each
+ * filename build a dex -> path table. A renamed or missing file then degrades
+ * to "no icon" rather than to a wrong one.
+ *
+ * All 1025 images together are well under a megabyte, so they are cached for
+ * the life of the program and scrolling never touches the disk again.
+ */
+static char       sprite_path[MAX_POKEMON + 1][256];
+static GdkPixbuf *sprite_cache[MAX_POKEMON + 1];
+
+static void sprites_init(void)
+{
+    /* Same fallbacks as the CSVs, so running from build/ still works. */
+    static const char *candidates[] = {
+        SPRITE_DIR, "../" SPRITE_DIR, "../../" SPRITE_DIR
+    };
+
+    for (size_t i = 0; i < sizeof candidates / sizeof candidates[0]; i++) {
+        GDir *dir = g_dir_open(candidates[i], 0, NULL);
+        if (dir == NULL) {
+            continue;
+        }
+        const char *name;
+        while ((name = g_dir_read_name(dir)) != NULL) {
+            int dex = atoi(name);       /* "0595_joltik.png" -> 595 */
+            if (dex >= 1 && dex <= MAX_POKEMON) {
+                g_snprintf(sprite_path[dex], sizeof sprite_path[dex],
+                           "%s/%s", candidates[i], name);
+            }
+        }
+        g_dir_close(dir);
+        return;
+    }
+
+    g_printerr("No %s/ directory found -- the table will have no icons.\n",
+               SPRITE_DIR);
+}
+
+/* The cached 16x16 sprite for a dex number, or NULL if there is not one. */
+static GdkPixbuf *sprite_for(int dex)
+{
+    if (dex < 1 || dex > MAX_POKEMON || sprite_path[dex][0] == '\0') {
+        return NULL;
+    }
+    if (sprite_cache[dex] == NULL) {
+        sprite_cache[dex] = gdk_pixbuf_new_from_file(sprite_path[dex], NULL);
+    }
+    return sprite_cache[dex];
 }
 
 /* ------------------------------------------------------------------ *
@@ -299,6 +362,20 @@ static void show_pokemon(AppState *state, const Pokemon *p)
 {
     gtk_label_set_text(GTK_LABEL(state->detail_name), p->name);
 
+    /*
+     * Scaled with NEAREST, not a smooth filter: these are 16x16 pixel art, and
+     * interpolating up to 64x64 turns crisp pixels into mush.
+     */
+    GdkPixbuf *small_sprite = sprite_for(p->dex);
+    if (small_sprite != NULL) {
+        GdkPixbuf *big = gdk_pixbuf_scale_simple(small_sprite, SPRITE_LARGE,
+                                                 SPRITE_LARGE, GDK_INTERP_NEAREST);
+        gtk_image_set_from_pixbuf(GTK_IMAGE(state->detail_sprite), big);
+        g_object_unref(big);
+    } else {
+        gtk_image_clear(GTK_IMAGE(state->detail_sprite));
+    }
+
     GString *types = g_string_new(NULL);
     append_type_badge(types, p->type1);
     append_type_badge(types, p->type2);
@@ -463,7 +540,18 @@ static void add_column(GtkWidget *tree, const char *title, int column,
 
 static void add_number_column(GtkWidget *tree, const char *title, int column)
 {
-    add_column(tree, title, column, 64, TRUE);
+    add_column(tree, title, column, 62, TRUE);
+}
+
+/* The sprite column: no title, no sorting, just the icon. */
+static void add_icon_column(GtkWidget *tree, int column)
+{
+    GtkCellRenderer *renderer = gtk_cell_renderer_pixbuf_new();
+    GtkTreeViewColumn *col = gtk_tree_view_column_new_with_attributes(
+        "", renderer, "pixbuf", column, NULL);
+    gtk_tree_view_column_set_sizing(col, GTK_TREE_VIEW_COLUMN_FIXED);
+    gtk_tree_view_column_set_fixed_width(col, 30);
+    gtk_tree_view_append_column(GTK_TREE_VIEW(tree), col);
 }
 
 static void add_text_column(GtkWidget *tree, const char *title, int column)
@@ -509,7 +597,8 @@ static GtkWidget *build_dex_page(AppState *state)
                                       G_TYPE_STRING, G_TYPE_STRING,
                                       G_TYPE_INT, G_TYPE_INT, G_TYPE_INT,
                                       G_TYPE_INT, G_TYPE_INT, G_TYPE_INT,
-                                      G_TYPE_INT, G_TYPE_INT);
+                                      G_TYPE_INT, G_TYPE_INT,
+                                      GDK_TYPE_PIXBUF);
 
     for (int i = 0; i < state->count; i++) {
         const Pokemon *p = &state->roster[i];
@@ -528,6 +617,7 @@ static GtkWidget *build_dex_page(AppState *state)
                            COL_SPE,   p->speed,
                            COL_TOTAL, p->total,
                            COL_INDEX, i,
+                           COL_ICON,  sprite_for(p->dex),
                            -1);
     }
 
@@ -553,11 +643,12 @@ static GtkWidget *build_dex_page(AppState *state)
      * gain by risking it.
      */
 
-    /* 50 + 124 + 76 + 76 + 7*64 = 774, just inside TABLE_WIDTH. */
-    add_column(state->tree, "#",    COL_DEX,   50,  TRUE);
-    add_column(state->tree, "Name", COL_NAME,  124, FALSE);
-    add_column(state->tree, "Type", COL_TYPE1, 76,  FALSE);
-    add_column(state->tree, "",     COL_TYPE2, 76,  FALSE);
+    /* 30 + 46 + 112 + 74 + 74 + 7*62 = 770, just inside TABLE_WIDTH. */
+    add_icon_column(state->tree, COL_ICON);
+    add_column(state->tree, "#",    COL_DEX,   46,  TRUE);
+    add_column(state->tree, "Name", COL_NAME,  112, FALSE);
+    add_column(state->tree, "Type", COL_TYPE1, 74,  FALSE);
+    add_column(state->tree, "",     COL_TYPE2, 74,  FALSE);
     add_number_column(state->tree, "HP",    COL_HP);
     add_number_column(state->tree, "Atk",   COL_ATK);
     add_number_column(state->tree, "Def",   COL_DEF);
@@ -577,11 +668,18 @@ static GtkWidget *build_dex_page(AppState *state)
     gtk_container_set_border_width(GTK_CONTAINER(details), 12);
     gtk_style_context_add_class(gtk_widget_get_style_context(details), "panel");
 
+    GtkWidget *header = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 10);
+    state->detail_sprite = gtk_image_new();
+    gtk_widget_set_size_request(state->detail_sprite, SPRITE_LARGE, SPRITE_LARGE);
+    gtk_box_pack_start(GTK_BOX(header), state->detail_sprite, FALSE, FALSE, 0);
+
     state->detail_name = gtk_label_new("");
     gtk_label_set_xalign(GTK_LABEL(state->detail_name), 0.0);
+    gtk_widget_set_valign(state->detail_name, GTK_ALIGN_CENTER);
     gtk_style_context_add_class(gtk_widget_get_style_context(state->detail_name),
                                 "title");
-    gtk_box_pack_start(GTK_BOX(details), state->detail_name, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(header), state->detail_name, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(details), header, FALSE, FALSE, 0);
 
     state->detail_types = gtk_label_new("");
     gtk_label_set_xalign(GTK_LABEL(state->detail_types), 0.0);
@@ -763,6 +861,7 @@ static void activate(GtkApplication *app, gpointer data)
     AppState *state = data;
 
     load_css();
+    sprites_init();
 
     GtkWidget *window = gtk_application_window_new(app);
     gtk_window_set_title(GTK_WINDOW(window), "The Strongest Pokemon -- Pokedex");

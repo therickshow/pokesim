@@ -1033,6 +1033,73 @@ static void report_duel(const Pokemon *a, const Pokemon *b,
 }
 
 /* ------------------------------------------------------------------ *
+ * Tournament report (console)
+ * ------------------------------------------------------------------ */
+
+static void tournament_progress(double fraction, void *user_data)
+{
+    (void)user_data;
+    fprintf(stderr, "\r  %5.1f%% ", fraction * 100.0);
+    fflush(stderr);
+}
+
+static int compare_rank(const void *x, const void *y)
+{
+    const RankEntry *a = x;
+    const RankEntry *b = y;
+    if (a->wins != b->wins) {
+        return (b->wins > a->wins) ? 1 : -1;
+    }
+    return (int)(b->damage_dealt - a->damage_dealt);
+}
+
+static void report_tournament(const Pokemon *roster, int count,
+                              double chart[TYPE_COUNT][TYPE_COUNT], int runs)
+{
+    static RankEntry table[MAX_POKEMON];
+
+    long long pairs = (long long)count * (count - 1) / 2;
+    printf("Round robin: %d species, %lld pairings, %d battles each = %lld battles\n",
+           count, pairs, runs, pairs * runs);
+
+    GTimer *timer = g_timer_new();
+    run_tournament(roster, count, chart, runs, table, NULL,
+                   tournament_progress, NULL);
+    double seconds = g_timer_elapsed(timer, NULL);
+    g_timer_destroy(timer);
+
+    fprintf(stderr, "\r");
+    printf("Finished in %.1f s (%.0f battles/second)\n\n",
+           seconds, (double)(pairs * runs) / (seconds > 0 ? seconds : 1));
+
+    /* Rank a copy so the dex order of `table` is left alone. */
+    static RankEntry sorted[MAX_POKEMON];
+    memcpy(sorted, table, sizeof(RankEntry) * count);
+    qsort(sorted, count, sizeof(RankEntry), compare_rank);
+
+    printf("%-5s %-14s %7s %7s %7s  %s\n",
+           "rank", "name", "wins", "losses", "win%", "avg turns");
+    for (int i = 0; i < 25 && i < count; i++) {
+        const RankEntry *e = &sorted[i];
+        const Pokemon   *p = &roster[e->dex - 1];
+        printf("%-5d %-14s %7d %7d %6.1f%%  %.1f\n",
+               i + 1, p->name, e->wins, e->losses,
+               100.0 * e->wins / (e->battles > 0 ? e->battles : 1),
+               (double)e->turns / (e->battles > 0 ? e->battles : 1));
+    }
+
+    printf("\n  ... bottom 5 ...\n");
+    for (int i = count - 5; i < count; i++) {
+        const RankEntry *e = &sorted[i];
+        const Pokemon   *p = &roster[e->dex - 1];
+        printf("%-5d %-14s %7d %7d %6.1f%%  %.1f\n",
+               i + 1, p->name, e->wins, e->losses,
+               100.0 * e->wins / (e->battles > 0 ? e->battles : 1),
+               (double)e->turns / (e->battles > 0 ? e->battles : 1));
+    }
+}
+
+/* ------------------------------------------------------------------ *
  * Self-tests
  * ------------------------------------------------------------------ */
 
@@ -1334,6 +1401,8 @@ int main(int argc, char *argv[])
     int         testing     = 0;
     int         reporting   = 0;
     int         duelling    = 0;
+    int         tourney     = 0;
+    int         tourney_runs = 11;
     int         duel_runs   = 1000;
     const char *duel_a      = NULL;
     const char *duel_b      = NULL;
@@ -1345,6 +1414,8 @@ int main(int argc, char *argv[])
             reporting = 1;
         } else if (strcmp(argv[i], "--duel") == 0) {
             duelling = 1;
+        } else if (strcmp(argv[i], "--tournament") == 0) {
+            tourney = 1;
         } else if (duelling && duel_a == NULL) {
             duel_a = argv[i];
         } else if (duelling && duel_b == NULL) {
@@ -1353,6 +1424,11 @@ int main(int argc, char *argv[])
             duel_runs = atoi(argv[i]);
             if (duel_runs < 1) {
                 duel_runs = 1;
+            }
+        } else if (tourney) {
+            tourney_runs = atoi(argv[i]);
+            if (tourney_runs < 1) {
+                tourney_runs = 1;
             }
         }
     }
@@ -1386,6 +1462,7 @@ int main(int argc, char *argv[])
                 unresolved, moves_path);
     }
     battle_seed(0x5eed1e);
+    battle_prepare(roster, count);
 
     if (testing) {
         return run_tests(roster, count, chart) ? 0 : 1;
@@ -1393,6 +1470,10 @@ int main(int argc, char *argv[])
     if (reporting) {
         printf("thestrongestpokemon -- data layer\n");
         report(roster, count, chart);
+        return 0;
+    }
+    if (tourney) {
+        report_tournament(roster, count, chart, tourney_runs);
         return 0;
     }
     if (duelling) {

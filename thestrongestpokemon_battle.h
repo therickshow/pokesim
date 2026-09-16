@@ -96,4 +96,34 @@ void simulate_series(const Pokemon *a, const Pokemon *b,
 /* Name of a move slot, for reporting. Returns "-" for an empty slot. */
 const char *moveset_name(const Pokemon *p, int slot);
 
+/*
+ * Build the lookup tables the engine needs. Must be called once after
+ * load_moves() and resolve_roster_moves(), before any battle runs.
+ */
+void battle_prepare(const Pokemon *roster, int count);
+
+/* One species' record across a whole round-robin. */
+typedef struct {
+    int       dex;
+    int       wins, losses, draws;
+    int       battles;
+    long long damage_dealt, damage_taken;
+    long long turns;
+} RankEntry;
+
+/*
+ * Every species against every other, `runs_per_pair` times each. `out` must
+ * have room for `count` entries and is filled in dex order.
+ *
+ * `progress` is called occasionally with a fraction from 0 to 1 -- it runs on
+ * whichever thread called this, so a GUI must marshal back to the main loop.
+ * Setting *cancel to non-zero stops the run early. Both may be NULL.
+ */
+typedef void (*ProgressFn)(double fraction, void *user_data);
+
+void run_tournament(const Pokemon *roster, int count,
+                    double chart[TYPE_COUNT][TYPE_COUNT],
+                    int runs_per_pair, RankEntry *out,
+                    volatile int *cancel, ProgressFn progress, void *user_data);
+
 #endif /* THESTRONGESTPOKEMON_BATTLE_H */

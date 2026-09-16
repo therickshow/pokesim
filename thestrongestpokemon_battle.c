@@ -287,6 +287,46 @@ static const RecoilDrain *recoil_drain(const char *name)
 }
 
 /* ------------------------------------------------------------------ *
+ * Precomputed per-move lookups
+ *
+ * special_kind(), status_effect() and recoil_drain() all walk a table doing
+ * strcmp. That is fine once, but the move chooser calls them for every move
+ * of every Pokemon on every turn -- and a full round robin is hundreds of
+ * millions of turns, where it dominates the runtime. They are resolved once
+ * here instead, indexed by move id.
+ * ------------------------------------------------------------------ */
+
+static SpecialMove         move_special[MAX_MOVE_TABLE];
+static const StatusEffect *move_effect[MAX_MOVE_TABLE];
+static const RecoilDrain  *move_rd[MAX_MOVE_TABLE];
+
+/* Movesets are fixed per species, so work them out once rather than on every
+ * battler that is created. */
+static int cached_moves[MAX_POKEMON + 1][TEAM_MOVES];
+static int cached_count[MAX_POKEMON + 1];
+static int tables_ready = 0;
+
+static void choose_moveset_uncached(const Pokemon *p, int out[TEAM_MOVES],
+                                    int *count);
+
+void battle_prepare(const Pokemon *roster, int count)
+{
+    for (int i = 0; i < move_table_count && i < MAX_MOVE_TABLE; i++) {
+        move_special[i] = special_kind(move_table[i].name);
+        move_effect[i]  = status_effect(move_table[i].name);
+        move_rd[i]      = recoil_drain(move_table[i].name);
+    }
+    for (int i = 0; i < count; i++) {
+        int dex = roster[i].dex;
+        if (dex >= 1 && dex <= MAX_POKEMON) {
+            choose_moveset_uncached(&roster[i], cached_moves[dex],
+                                    &cached_count[dex]);
+        }
+    }
+    tables_ready = 1;
+}
+
+/* ------------------------------------------------------------------ *
  * Battler
  * ------------------------------------------------------------------ */
 
@@ -360,7 +400,8 @@ static void battler_init(Battler *b, const Pokemon *sp)
  * Choosing which four moves a species fights with
  * ------------------------------------------------------------------ */
 
-void choose_moveset(const Pokemon *p, int out[TEAM_MOVES], int *count)
+static void choose_moveset_uncached(const Pokemon *p, int out[TEAM_MOVES],
+                                    int *count)
 {
     *count = 0;
     for (int i = 0; i < TEAM_MOVES; i++) {
@@ -385,6 +426,7 @@ void choose_moveset(const Pokemon *p, int out[TEAM_MOVES], int *count)
             status_effect(move_table[id].name) == NULL) {
             continue;
         }
+
         int already = 0;
         for (int j = 0; j < *count; j++) {
             if (out[j] == id) {
@@ -405,6 +447,18 @@ void choose_moveset(const Pokemon *p, int out[TEAM_MOVES], int *count)
     if (*count == 0 && p->move_count > 0 && p->moves[p->move_count - 1].id >= 0) {
         out[(*count)++] = p->moves[p->move_count - 1].id;
     }
+}
+
+void choose_moveset(const Pokemon *p, int out[TEAM_MOVES], int *count)
+{
+    if (tables_ready && p->dex >= 1 && p->dex <= MAX_POKEMON) {
+        for (int i = 0; i < TEAM_MOVES; i++) {
+            out[i] = cached_moves[p->dex][i];
+        }
+        *count = cached_count[p->dex];
+        return;
+    }
+    choose_moveset_uncached(p, out, count);
 }
 
 const char *moveset_name(const Pokemon *p, int slot)
@@ -642,10 +696,10 @@ static int choose_move(Battler *user, Battler *target, int turn,
             continue;                       /* out of power points */
         }
         const MoveData *mv = &move_table[user->moves[i]];
-        SpecialMove kind = special_kind(mv->name);
+        SpecialMove kind = move_special[user->moves[i]];
 
         if (mv->category == CAT_STATUS) {
-            const StatusEffect *fx = status_effect(mv->name);
+            const StatusEffect *fx = move_effect[user->moves[i]];
             if (fx == NULL) {
                 continue;
             }
@@ -832,7 +886,7 @@ static int take_turn(Battler *user, Battler *target, int turn,
     user->pp[slot]--;
 
     const MoveData *mv = &move_table[user->moves[slot]];
-    SpecialMove kind = special_kind(mv->name);
+    SpecialMove kind = move_special[user->moves[slot]];
 
     /* Accuracy. A blank accuracy in the file means the move never misses. */
     if (mv->accuracy > 0 && !rng_chance(mv->accuracy)) {
@@ -841,7 +895,7 @@ static int take_turn(Battler *user, Battler *target, int turn,
     }
 
     if (mv->category == CAT_STATUS) {
-        const StatusEffect *fx = status_effect(mv->name);
+        const StatusEffect *fx = move_effect[user->moves[slot]];
         if (fx != NULL) {
             apply_status_effect(user, target, fx);
         }
@@ -858,7 +912,7 @@ static int take_turn(Battler *user, Battler *target, int turn,
     target->last_damage_cat = mv->category;
 
     /* Recoil and drain both key off the damage actually dealt. */
-    const RecoilDrain *rd = recoil_drain(mv->name);
+    const RecoilDrain *rd = move_rd[user->moves[slot]];
     if (rd != NULL && damage > 0) {
         if (rd->recoil_percent > 0) {
             int hurt = damage * rd->recoil_percent / 100;
@@ -1008,5 +1062,66 @@ void simulate_series(const Pokemon *a, const Pokemon *b,
     memset(out, 0, sizeof *out);
     for (int i = 0; i < runs; i++) {
         simulate_battle(a, b, chart, out);
+    }
+}
+
+/* ------------------------------------------------------------------ *
+ * Round robin
+ * ------------------------------------------------------------------ */
+
+void run_tournament(const Pokemon *roster, int count,
+                    double chart[TYPE_COUNT][TYPE_COUNT],
+                    int runs_per_pair, RankEntry *out,
+                    volatile int *cancel, ProgressFn progress, void *user_data)
+{
+    for (int i = 0; i < count; i++) {
+        memset(&out[i], 0, sizeof out[i]);
+        out[i].dex = roster[i].dex;
+    }
+
+    /*
+     * Only the pairs, not the ordered pairs: A against B is the same fight as
+     * B against A, so running both would double the work for nothing. Each
+     * result is credited to both sides.
+     */
+    long long total_pairs = (long long)count * (count - 1) / 2;
+    long long done        = 0;
+    long long next_report = 0;
+
+    for (int i = 0; i < count; i++) {
+        for (int j = i + 1; j < count; j++) {
+            if (cancel != NULL && *cancel) {
+                return;
+            }
+
+            SeriesStats s;
+            simulate_series(&roster[i], &roster[j], chart, runs_per_pair, &s);
+
+            out[i].wins    += s.a_wins;
+            out[i].losses  += s.b_wins;
+            out[i].draws   += s.draws;
+            out[i].battles += s.battles;
+            out[i].damage_dealt += s.a_damage;
+            out[i].damage_taken += s.b_damage;
+            out[i].turns   += s.total_turns;
+
+            out[j].wins    += s.b_wins;
+            out[j].losses  += s.a_wins;
+            out[j].draws   += s.draws;
+            out[j].battles += s.battles;
+            out[j].damage_dealt += s.b_damage;
+            out[j].damage_taken += s.a_damage;
+            out[j].turns   += s.total_turns;
+
+            done++;
+            if (progress != NULL && done >= next_report) {
+                progress((double)done / (double)total_pairs, user_data);
+                next_report = done + total_pairs / 200 + 1;
+            }
+        }
+    }
+
+    if (progress != NULL) {
+        progress(1.0, user_data);
     }
 }

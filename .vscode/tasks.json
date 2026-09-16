@@ -1,19 +1,22 @@
 {
+    // These call library/scripts/build.py rather than gcc directly.
+    //
+    // The old tasks compiled ${file} -- just the one file you had open -- with
+    // no pkg-config flags. That was fine when this project was a single .c
+    // file with no libraries. It is now three .c files that need GTK, so
+    // building the active file alone fails immediately on <gtk/gtk.h>, and
+    // would fail again at link time even if the header were found.
+    //
+    // build.py compiles every .c in the folder together and asks pkg-config
+    // for the GTK flags, so Ctrl+Shift+B does the same thing the README does.
     "version": "2.0.0",
     "tasks": [
         {
-            "type": "cppbuild",
-            "label": "C: build active file (debug)",
-            "command": "C:\\msys64\\mingw64\\bin\\gcc.exe",
+            "type": "shell",
+            "label": "Build PokeSim (debug)",
+            "command": "${fileDirname}\\..\\library\\.venv\\bin\\python.exe",
             "args": [
-                "-fdiagnostics-color=always",
-                "-Wall",
-                "-Wextra",
-                "-std=c17",
-                "-g",
-                "${file}",
-                "-o",
-                "${fileDirname}\\build\\${fileBasenameNoExtension}.exe"
+                "${fileDirname}\\..\\library\\scripts\\build.py"
             ],
             "options": {
                 "cwd": "${fileDirname}"
@@ -25,21 +28,15 @@
                 "kind": "build",
                 "isDefault": true
             },
-            "detail": "Warnings on, debug symbols. Output goes to build/."
+            "detail": "All sources, warnings on, debug symbols. Output goes to build/."
         },
         {
-            "type": "cppbuild",
-            "label": "C: build active file (release)",
-            "command": "C:\\msys64\\mingw64\\bin\\gcc.exe",
+            "type": "shell",
+            "label": "Build PokeSim (release)",
+            "command": "${fileDirname}\\..\\library\\.venv\\bin\\python.exe",
             "args": [
-                "-fdiagnostics-color=always",
-                "-Wall",
-                "-Wextra",
-                "-std=c17",
-                "-O2",
-                "${file}",
-                "-o",
-                "${fileDirname}\\build\\${fileBasenameNoExtension}.exe"
+                "${fileDirname}\\..\\library\\scripts\\build.py",
+                "--release"
             ],
             "options": {
                 "cwd": "${fileDirname}"
@@ -48,7 +45,38 @@
                 "$gcc"
             ],
             "group": "build",
-            "detail": "Optimised build."
+            "detail": "Optimised. The tournament runs about three times faster."
+        },
+        {
+            "type": "shell",
+            "label": "Build and run PokeSim",
+            "command": "${fileDirname}\\..\\library\\.venv\\bin\\python.exe",
+            "args": [
+                "${fileDirname}\\..\\library\\scripts\\build.py",
+                "--run"
+            ],
+            "options": {
+                "cwd": "${fileDirname}"
+            },
+            "problemMatcher": [
+                "$gcc"
+            ],
+            "group": "build",
+            "detail": "Builds, then opens the window."
+        },
+        {
+            "type": "shell",
+            "label": "Run PokeSim self-tests",
+            "command": "${fileDirname}\\build\\pokesim.exe",
+            "args": [
+                "--test"
+            ],
+            "options": {
+                "cwd": "${fileDirname}"
+            },
+            "problemMatcher": [],
+            "group": "test",
+            "detail": "57 checks over the data, the loaders and the battle engine."
         }
     ]
 }

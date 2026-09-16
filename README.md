@@ -36,11 +36,16 @@ and a damage ratio. Sortable and filterable.
 
 ## Running it
 
-Requires [MSYS2](https://www.msys2.org/) with GTK 3 (`mingw-w64-x86_64-gtk3`)
-and `mingw-w64-x86_64-pkgconf`.
+**Just want to use it?** Download the release zip, unpack it anywhere, and
+double-click `pokesim.exe`. Nothing needs installing — the GTK runtime ships
+inside the folder. Keep the folder together: the `.exe` on its own will not run.
+
+**Building from source** needs [MSYS2](https://www.msys2.org/) with GTK 3
+(`mingw-w64-x86_64-gtk3`) and `mingw-w64-x86_64-pkgconf`.
 
 ```powershell
-python "..\library\scripts\build.py" --run   # build and open the window
+python "..\library\scripts\build.py" --run       # build and open the window
+python "..\library\scripts\package.py" --zip     # standalone folder, plus a zip
 ```
 
 It also works from a terminal without the GUI:

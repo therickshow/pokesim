@@ -52,8 +52,8 @@ build\pokesim.exe --report           # what is in the data files
 build\pokesim.exe --test             # 57 self-tests
 ```
 
-The window is a fixed 16:10 at 1200×750 and deliberately not resizable — the
-column widths are budgeted against exactly that size.
+The window opens filling your screen's work area — the desktop minus the
+taskbar — as reported by the system, and resizes freely from there.
 
 ---
 

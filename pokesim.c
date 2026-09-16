@@ -49,15 +49,17 @@ enum {
 enum { MOVE_COL_LEVEL, MOVE_COL_NAME, MOVE_N_COLUMNS };
 
 /*
- * The window is a fixed 16:10 -- the same shape as the display -- and cannot
- * be resized. Every width further down is budgeted against these numbers, so
- * allowing a resize would only let the user break the layout. They are
- * logical pixels: on this HiDPI screen GTK doubles them for you.
+ * The window opens filling the screen's work area -- the desktop minus the
+ * taskbar -- as reported by the system, and can be resized freely. The table
+ * takes whatever width is left after the detail panel, so a bigger screen
+ * simply shows more of it.
+ *
+ * MIN_* is the smallest the layout still works at, not a target.
  */
-#define WINDOW_WIDTH   1200
-#define WINDOW_HEIGHT   750
+#define MIN_WIDTH      1000
+#define MIN_HEIGHT      640
 #define PANEL_WIDTH     380
-#define TABLE_WIDTH     780
+#define TABLE_WIDTH     520     /* minimum, not fixed: the table expands */
 
 /* Sprites: 1025 32x32 PNGs named NNNN_slug.png, one per dex number. */
 #define SPRITE_DIR    "sprites"
@@ -1004,10 +1006,27 @@ static void activate(GtkApplication *app, gpointer data)
 
     GtkWidget *window = gtk_application_window_new(app);
     gtk_window_set_title(GTK_WINDOW(window), "PokeSim");
-    gtk_window_set_default_size(GTK_WINDOW(window), WINDOW_WIDTH, WINDOW_HEIGHT);
-    gtk_widget_set_size_request(window, WINDOW_WIDTH, WINDOW_HEIGHT);
-    gtk_window_set_resizable(GTK_WINDOW(window), FALSE);
+    /*
+     * Size to the monitor's work area rather than a hard-coded number, so the
+     * window fits whatever display it opens on and never hides behind the
+     * taskbar. Maximising on top of that lets the window manager have the
+     * final say, which is what the system settings are for.
+     */
+    GdkDisplay *display = gdk_display_get_default();
+    GdkMonitor *monitor = gdk_display_get_primary_monitor(display);
+    if (monitor == NULL) {
+        monitor = gdk_display_get_monitor(display, 0);
+    }
+    if (monitor != NULL) {
+        GdkRectangle area;
+        gdk_monitor_get_workarea(monitor, &area);
+        gtk_window_set_default_size(GTK_WINDOW(window), area.width, area.height);
+    } else {
+        gtk_window_set_default_size(GTK_WINDOW(window), MIN_WIDTH, MIN_HEIGHT);
+    }
+    gtk_widget_set_size_request(window, MIN_WIDTH, MIN_HEIGHT);
     gtk_window_set_position(GTK_WINDOW(window), GTK_WIN_POS_CENTER);
+    gtk_window_maximize(GTK_WINDOW(window));
 
     GtkWidget *notebook = gtk_notebook_new();
     gtk_notebook_append_page(GTK_NOTEBOOK(notebook), build_dex_page(state),
@@ -1240,40 +1259,56 @@ static void on_duel_run(GtkButton *button, gpointer data)
 
     GString *out = g_string_new(NULL);
     g_string_append_printf(
-        out, "<span size=\"large\"><b>%s %.1f%%</b>   vs   <b>%s %.1f%%</b></span>\n"
-             "<span foreground=\"#9aa4b2\">+/- %.1f%% at 95%% confidence"
-             "   %d draws</span>",
-        a->name, pa, b->name, pb, margin, s.draws);
+        out, "<span size=\"large\"><b>%s wins %.1f%%</b>   |   "
+             "<b>%s wins %.1f%%</b></span>\n"
+             "<span foreground=\"#9aa4b2\">give or take %.1f%% "
+             "(95%% confidence over %d battles)   |   %d draws</span>",
+        a->name, pa, b->name, pb, margin, s.battles, s.draws);
     gtk_label_set_markup(GTK_LABEL(state->duel_result), out->str);
     g_string_free(out, TRUE);
 
+    int battles = (s.battles > 0) ? s.battles : 1;
+
+    /*
+     * Per-battle averages rather than raw totals: "1,058,247 damage" over a
+     * thousand battles means nothing to a reader, but "1058 per battle" can be
+     * compared against an HP bar directly.
+     */
     GString *detail = g_string_new(NULL);
     g_string_append_printf(detail,
-        "battles      %d\n"
-        "turns        avg %.1f   shortest %d   longest %d\n"
-        "damage       %s %lld   |   %s %lld\n"
-        "crits        %s %d   |   %s %d\n"
-        "misses       %s %d   |   %s %d\n",
-        s.battles,
-        (double)s.total_turns / (s.battles > 0 ? s.battles : 1),
-        s.min_turns, s.max_turns,
-        a->name, s.a_damage, b->name, s.b_damage,
-        a->name, s.a_crits, b->name, s.b_crits,
-        a->name, s.a_misses, b->name, s.b_misses);
+        "%-26s %14s   %14s\n"
+        "%-26s %14d   %14d\n"
+        "%-26s %14.1f   %14.1f\n"
+        "%-26s %14.2f   %14.2f\n"
+        "%-26s %14.2f   %14.2f\n",
+        "", a->name, b->name,
+        "Battles won", s.a_wins, s.b_wins,
+        "Damage dealt per battle",
+        (double)s.a_damage / battles, (double)s.b_damage / battles,
+        "Critical hits per battle",
+        (double)s.a_crits / battles, (double)s.b_crits / battles,
+        "Missed attacks per battle",
+        (double)s.a_misses / battles, (double)s.b_misses / battles);
 
-    g_string_append_printf(detail, "\nmove usage\n");
+    g_string_append_printf(detail,
+        "\n%d battles fought.  A fight lasts %.1f turns on average "
+        "(shortest %d, longest %d).\n",
+        s.battles,
+        (double)s.total_turns / battles, s.min_turns, s.max_turns);
+
+    g_string_append_printf(detail, "\nHow often each move was chosen\n");
     for (int i = 0; i < TEAM_MOVES; i++) {
         if (s.a_move_used[i] > 0) {
-            g_string_append_printf(detail, "  %-12s %-18s %d\n",
+            g_string_append_printf(detail, "  %-12s %-20s %5.1f per battle\n",
                                    i == 0 ? a->name : "", moveset_name(a, i),
-                                   s.a_move_used[i]);
+                                   (double)s.a_move_used[i] / battles);
         }
     }
     for (int i = 0; i < TEAM_MOVES; i++) {
         if (s.b_move_used[i] > 0) {
-            g_string_append_printf(detail, "  %-12s %-18s %d\n",
+            g_string_append_printf(detail, "  %-12s %-20s %5.1f per battle\n",
                                    i == 0 ? b->name : "", moveset_name(b, i),
-                                   s.b_move_used[i]);
+                                   (double)s.b_move_used[i] / battles);
         }
     }
 
@@ -1416,11 +1451,22 @@ static GtkWidget *build_duel_page(AppState *state)
 
     state->duel_detail = gtk_label_new("");
     gtk_label_set_xalign(GTK_LABEL(state->duel_detail), 0.0);
+    gtk_widget_set_valign(state->duel_detail, GTK_ALIGN_START);
     PangoAttrList *mono = pango_attr_list_new();
     pango_attr_list_insert(mono, pango_attr_family_new("monospace"));
     gtk_label_set_attributes(GTK_LABEL(state->duel_detail), mono);
     pango_attr_list_unref(mono);
-    gtk_box_pack_start(GTK_BOX(results), state->duel_detail, TRUE, TRUE, 0);
+
+    /*
+     * The move breakdown grows with however many moves each side used, so it
+     * can outgrow the panel on a short window. A scroller means the numbers
+     * are always reachable instead of being silently clipped.
+     */
+    GtkWidget *detail_scroll = gtk_scrolled_window_new(NULL, NULL);
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(detail_scroll),
+                                   GTK_POLICY_NEVER, GTK_POLICY_AUTOMATIC);
+    gtk_container_add(GTK_CONTAINER(detail_scroll), state->duel_detail);
+    gtk_box_pack_start(GTK_BOX(results), detail_scroll, TRUE, TRUE, 0);
 
     gtk_box_pack_start(GTK_BOX(page), results, TRUE, TRUE, 0);
 
@@ -1705,19 +1751,31 @@ static GtkWidget *build_rank_page(AppState *state)
     add_column(state->rank_tree, "Name",   RK_NAME,   116, FALSE);
     add_column(state->rank_tree, "Type",   RK_TYPE1,  72,  FALSE);
     add_column(state->rank_tree, "",       RK_TYPE2,  72,  FALSE);
-    add_column(state->rank_tree, "Wins",   RK_WINS,   66,  TRUE);
-    add_column(state->rank_tree, "Losses", RK_LOSSES, 66,  TRUE);
-    add_column(state->rank_tree, "Draws",  RK_DRAWS,  58,  TRUE);
-    add_percent_column(state->rank_tree, "Win %",   RK_WINPCT);
-    add_column(state->rank_tree, "BST",    RK_TOTAL,  56,  TRUE);
-    add_decimal_column(state->rank_tree, "Turns",   RK_AVGTURNS);
-    add_decimal_column(state->rank_tree, "Dmg +/-", RK_DMGRATIO);
+    add_column(state->rank_tree, "Battles won",  RK_WINS,   92,  TRUE);
+    add_column(state->rank_tree, "Battles lost", RK_LOSSES, 92,  TRUE);
+    add_column(state->rank_tree, "Draws",        RK_DRAWS,  62,  TRUE);
+    add_percent_column(state->rank_tree, "Win rate", RK_WINPCT);
+    add_column(state->rank_tree, "Base stats",   RK_TOTAL,  84,  TRUE);
+    add_decimal_column(state->rank_tree, "Avg turns",  RK_AVGTURNS);
+    add_decimal_column(state->rank_tree, "Dmg ratio",  RK_DMGRATIO);
 
     GtkWidget *scroll = gtk_scrolled_window_new(NULL, NULL);
     gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scroll),
                                    GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
     gtk_container_add(GTK_CONTAINER(scroll), state->rank_tree);
     gtk_box_pack_start(GTK_BOX(page), scroll, TRUE, TRUE, 0);
+
+    /* A column heading can only say so much; this says the rest. */
+    GtkWidget *legend = gtk_label_new(
+        "Every species fights every other species the chosen number of times.  "
+        "Win rate is battles won out of all battles fought, draws included.  "
+        "Avg turns is how long its fights last.  "
+        "Dmg ratio is damage dealt divided by damage taken \u2014 above 1.00 means it "
+        "hits harder than it is hit.  Click any heading to sort by it.");
+    gtk_label_set_xalign(GTK_LABEL(legend), 0.0);
+    gtk_label_set_line_wrap(GTK_LABEL(legend), TRUE);
+    gtk_style_context_add_class(gtk_widget_get_style_context(legend), "subtle");
+    gtk_box_pack_start(GTK_BOX(page), legend, FALSE, FALSE, 0);
 
     g_signal_connect(state->rank_button, "clicked", G_CALLBACK(on_rank_run), state);
     g_signal_connect(state->rank_search, "search-changed",

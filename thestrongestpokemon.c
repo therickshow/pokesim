@@ -57,9 +57,10 @@ enum { MOVE_COL_LEVEL, MOVE_COL_NAME, MOVE_N_COLUMNS };
 #define PANEL_WIDTH     380
 #define TABLE_WIDTH     780
 
-/* Sprites: 1025 16x16 PNGs named NNNN_slug.png, one per dex number. */
+/* Sprites: 1025 32x32 PNGs named NNNN_slug.png, one per dex number. */
 #define SPRITE_DIR    "sprites"
-#define SPRITE_LARGE   64      /* detail panel, scaled 4x from 16x16 */
+#define SPRITE_LARGE   96      /* detail panel, scaled 3x from 32x32 */
+#define SPRITE_COLUMN  38      /* table column: 32px plus a little padding */
 
 static const char *STAT_NAMES[6] = {
     "HP", "Attack", "Defense", "Sp. Atk", "Sp. Def", "Speed"
@@ -550,7 +551,7 @@ static void add_icon_column(GtkWidget *tree, int column)
     GtkTreeViewColumn *col = gtk_tree_view_column_new_with_attributes(
         "", renderer, "pixbuf", column, NULL);
     gtk_tree_view_column_set_sizing(col, GTK_TREE_VIEW_COLUMN_FIXED);
-    gtk_tree_view_column_set_fixed_width(col, 30);
+    gtk_tree_view_column_set_fixed_width(col, SPRITE_COLUMN);
     gtk_tree_view_append_column(GTK_TREE_VIEW(tree), col);
 }
 
@@ -643,10 +644,10 @@ static GtkWidget *build_dex_page(AppState *state)
      * gain by risking it.
      */
 
-    /* 30 + 46 + 112 + 74 + 74 + 7*62 = 770, just inside TABLE_WIDTH. */
+    /* 38 + 46 + 108 + 74 + 74 + 7*62 = 774, just inside TABLE_WIDTH. */
     add_icon_column(state->tree, COL_ICON);
     add_column(state->tree, "#",    COL_DEX,   46,  TRUE);
-    add_column(state->tree, "Name", COL_NAME,  112, FALSE);
+    add_column(state->tree, "Name", COL_NAME,  108, FALSE);
     add_column(state->tree, "Type", COL_TYPE1, 74,  FALSE);
     add_column(state->tree, "",     COL_TYPE2, 74,  FALSE);
     add_number_column(state->tree, "HP",    COL_HP);

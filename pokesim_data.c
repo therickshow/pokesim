@@ -1,12 +1,12 @@
 /*
- * thestrongestpokemon_data.c -- loading and validating the CSVs.
+ * pokesim_data.c -- loading and validating the CSVs.
  *
  * Nothing in here knows about GTK or about the console. It turns two files on
  * disk into an array of Pokemon and an 18x18 chart, and refuses loudly if
  * anything about them is not what we expect.
  */
 
-#include "thestrongestpokemon_data.h"
+#include "pokesim_data.h"
 
 #include <stdio.h>
 #include <stdlib.h>

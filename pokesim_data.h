@@ -1,18 +1,18 @@
 /*
- * thestrongestpokemon_data.h -- the roster and type chart, and how to load them.
+ * pokesim_data.h -- the roster and type chart, and how to load them.
  *
  * This header is the boundary between "where the data comes from" and "what we
- * do with it". thestrongestpokemon_data.c owns the parsing; the GUI and the
+ * do with it". pokesim_data.c owns the parsing; the GUI and the
  * console report both just include this and use the results. Splitting it this
  * way means the loader can be tested and reused without dragging GTK along.
  *
  * Note there is no main() in the .c file that implements this. build.py
  * compiles every .c in the folder into one executable, so exactly one file may
- * define main() -- that file is thestrongestpokemon.c.
+ * define main() -- that file is pokesim.c.
  */
 
-#ifndef THESTRONGESTPOKEMON_DATA_H
-#define THESTRONGESTPOKEMON_DATA_H
+#ifndef POKESIM_DATA_H
+#define POKESIM_DATA_H
 
 #include <stddef.h>
 
@@ -126,4 +126,4 @@ int resolve_roster_moves(Pokemon *roster, int count);
  */
 int split_csv(char *line, char *fields[], int max);
 
-#endif /* THESTRONGESTPOKEMON_DATA_H */
+#endif /* POKESIM_DATA_H */

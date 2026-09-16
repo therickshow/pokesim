@@ -1,5 +1,5 @@
 /*
- * thestrongestpokemon_battle.c -- the battle simulator.
+ * pokesim_battle.c -- the battle simulator.
  *
  * The damage formula is the real one:
  *
@@ -14,7 +14,7 @@
  * with the speed ratio, Low Kick with the target's weight, and so on.
  */
 
-#include "thestrongestpokemon_battle.h"
+#include "pokesim_battle.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -400,6 +400,35 @@ static void battler_init(Battler *b, const Pokemon *sp)
  * Choosing which four moves a species fights with
  * ------------------------------------------------------------------ */
 
+/*
+ * The four moves a species fights with.
+ *
+ * The obvious rule -- take the last four it learns -- turned out to be the
+ * single worst thing in the simulator. It rewards the order of a learnset
+ * rather than what a Pokemon can actually do: Charizard ends up with Flare
+ * Blitz, Inferno, Fire Spin and Scary Face, four Fire moves and no coverage,
+ * while its Air Slash, Dragon Claw and Heat Wave are thrown away for the
+ * crime of being learned at level 1. It then loses every single fight to
+ * Blastoise, which says far more about the rule than about Charizard.
+ *
+ * So instead: score every usable damaging move by power (with the same-type
+ * bonus applied, since that is real), then take the best move of each
+ * distinct type first. That guarantees coverage. Any slots still spare are
+ * filled with the next best moves regardless of type, so a Pokemon whose good
+ * moves really are all one type is not punished. The last slot is given to
+ * the best status move it has -- healing first, then setup, then a status
+ * condition -- because a heuristic chooser that never has a status move
+ * available cannot use three of its five rules.
+ */
+
+#define NOMINAL_POWER 60        /* stand-in for the moves whose power varies */
+
+typedef struct {
+    int id;
+    int value;
+    int type;
+} MoveCandidate;
+
 static void choose_moveset_uncached(const Pokemon *p, int out[TEAM_MOVES],
                                     int *count)
 {
@@ -408,41 +437,102 @@ static void choose_moveset_uncached(const Pokemon *p, int out[TEAM_MOVES],
         out[i] = -1;
     }
 
-    /*
-     * Walk the learn list backwards, so the last four moves it learns win --
-     * a simple, uniform rule that needs no judgement about what is "good".
-     * Duplicates and moves the engine cannot model are skipped.
-     */
-    for (int i = p->move_count - 1; i >= 0 && *count < TEAM_MOVES; i--) {
+    MoveCandidate cands[MAX_MOVES];
+    int           cand_count  = 0;
+    int           best_status = -1;
+    int           status_rank = 0;
+
+    for (int i = 0; i < p->move_count; i++) {
         int id = p->moves[i].id;
-        if (id < 0) {
-            continue;
-        }
-        if (special_kind(move_table[id].name) == SP_UNUSABLE) {
-            continue;
-        }
-        /* A status move we do not model would just waste a turn. */
-        if (move_table[id].category == CAT_STATUS &&
-            status_effect(move_table[id].name) == NULL) {
+        if (id < 0 || special_kind(move_table[id].name) == SP_UNUSABLE) {
             continue;
         }
 
-        int already = 0;
-        for (int j = 0; j < *count; j++) {
-            if (out[j] == id) {
-                already = 1;
+        int seen = 0;
+        for (int j = 0; j < cand_count; j++) {
+            if (cands[j].id == id) {
+                seen = 1;
             }
         }
-        if (!already) {
-            out[(*count)++] = id;
+        if (seen || id == best_status) {
+            continue;
+        }
+
+        const MoveData *m = &move_table[id];
+
+        if (m->category == CAT_STATUS) {
+            const StatusEffect *fx = status_effect(m->name);
+            if (fx == NULL) {
+                continue;               /* we do not model it, so skip it */
+            }
+            int rank = 1;               /* inflicts a condition */
+            for (int s = 0; s < ST_COUNT; s++) {
+                if (fx->self[s] > 0 || fx->foe[s] < 0) {
+                    rank = 2;           /* changes stats */
+                }
+            }
+            if (fx->heal_percent > 0) {
+                rank = 3;               /* heals */
+            }
+            if (rank > status_rank) {
+                status_rank = rank;
+                best_status = id;
+            }
+            continue;
+        }
+
+        int value = (m->power > 0) ? m->power : NOMINAL_POWER;
+        if (m->type == p->type1 || m->type == p->type2) {
+            value = value * 3 / 2;      /* same-type bonus is worth having */
+        }
+        value = value * ((m->accuracy > 0) ? m->accuracy : 100) / 100;
+
+        cands[cand_count].id    = id;
+        cands[cand_count].type  = m->type;
+        cands[cand_count].value = value;
+        cand_count++;
+    }
+
+    /* Strongest first. Insertion sort: there are at most 40 of them. */
+    for (int i = 1; i < cand_count; i++) {
+        MoveCandidate key = cands[i];
+        int j = i - 1;
+        while (j >= 0 && cands[j].value < key.value) {
+            cands[j + 1] = cands[j];
+            j--;
+        }
+        cands[j + 1] = key;
+    }
+
+    /* Hold the last slot for a status move, if it has one worth using. */
+    int damage_slots = (best_status >= 0) ? TEAM_MOVES - 1 : TEAM_MOVES;
+
+    /* Pass one: the best move of each distinct type, for coverage. */
+    int type_taken[TYPE_COUNT] = { 0 };
+    int taken[MAX_MOVES]       = { 0 };
+    for (int i = 0; i < cand_count && *count < damage_slots; i++) {
+        if (!type_taken[cands[i].type]) {
+            type_taken[cands[i].type] = 1;
+            taken[i] = 1;
+            out[(*count)++] = cands[i].id;
         }
     }
 
+    /* Pass two: fill anything left over with the next best, type regardless. */
+    for (int i = 0; i < cand_count && *count < damage_slots; i++) {
+        if (!taken[i]) {
+            taken[i] = 1;
+            out[(*count)++] = cands[i].id;
+        }
+    }
+
+    if (best_status >= 0 && *count < TEAM_MOVES) {
+        out[(*count)++] = best_status;
+    }
+
     /*
-     * Some species have no modellable move at all (Metapod knows only Harden,
-     * which we do model, but Ditto knows only Transform, which we do not).
-     * Falling back to the raw last move keeps them in the tournament, where
-     * they will simply lose or time out.
+     * Nothing modellable at all -- Ditto knows only Transform. Fall back to
+     * its last move so it still turns up and loses, rather than vanishing.
      */
     if (*count == 0 && p->move_count > 0 && p->moves[p->move_count - 1].id >= 0) {
         out[(*count)++] = p->moves[p->move_count - 1].id;
@@ -688,7 +778,8 @@ static int expected_damage(const Battler *user, const Battler *target,
 static int choose_move(Battler *user, Battler *target, int turn,
                        double chart[TYPE_COUNT][TYPE_COUNT])
 {
-    int best_slot = -1, best_value = -1;
+    int best_slot = -1, best_score = -1;
+    int kill_slot = -1, kill_damage = -1;
     int heal_slot = -1, setup_slot = -1, status_slot = -1;
 
     for (int i = 0; i < user->move_count; i++) {
@@ -722,16 +813,45 @@ static int choose_move(Battler *user, Battler *target, int turn,
             continue;
         }
 
-        int value = expected_damage(user, target, mv, kind, chart);
-        if (value > best_value) {
-            best_value = value;
+        int damage = expected_damage(user, target, mv, kind, chart);
+
+        /* Raw damage is what decides whether a hit is lethal. */
+        if (damage > kill_damage) {
+            kill_damage = damage;
+            kill_slot   = i;
+        }
+
+        /*
+         * What a move is worth, though, is not what it deals -- it is what it
+         * deals minus what it costs. Flare Blitz hits for 154 and takes 51 off
+         * its own user; Air Slash hits for 105 and is free. Without this,
+         * Charizard picks Flare Blitz every turn, out-damages Venusaur eight
+         * to one, and still loses 999 fights in 1000 to its own recoil.
+         * Draining moves get credit for the other half of the same idea.
+         */
+        int score = damage;
+        const RecoilDrain *rd = move_rd[user->moves[i]];
+        if (rd != NULL) {
+            /*
+             * Recoil is charged at one and a half times face value. A point
+             * of your own HP is worth more than a point of theirs, because it
+             * is also the clock you are fighting against -- and at face value
+             * Flare Blitz still edged out Air Slash (104 against 100) and
+             * Charizard carried on killing itself.
+             */
+            score -= damage * rd->recoil_percent * 3 / 200;
+            score += damage * rd->drain_percent / 200;
+        }
+
+        if (score > best_score) {
+            best_score = score;
             best_slot  = i;
         }
     }
 
-    /* 1. Finish it if we can. */
-    if (best_slot >= 0 && best_value >= target->hp) {
-        return best_slot;
+    /* 1. Finish it if we can -- recoil does not matter if the fight ends. */
+    if (kill_slot >= 0 && kill_damage >= target->hp) {
+        return kill_slot;
     }
 
     /* 2. Heal when badly hurt, but not at full-ish health. */

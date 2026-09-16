@@ -1,13 +1,13 @@
 /*
- * thestrongestpokemon -- Stage 2: a GTK front end for the data layer.
+ * PokeSim -- a Pokemon battle simulator with a GTK front end.
  *
- * The loader lives in thestrongestpokemon_data.c. This file is the part you
+ * The loader lives in pokesim_data.c. This file is the part you
  * look at: a browsable Pokedex with search, filtering, sortable columns, a
  * detail panel, and the full type chart.
  *
- *     thestrongestpokemon              open the window
- *     thestrongestpokemon --report     the old console summary
- *     thestrongestpokemon --test       run the self-tests
+ *     pokesim              open the window
+ *     pokesim --report     the console data summary
+ *     pokesim --test       run the self-tests
  *
  * There are still no battles. This is the shell the tournament results will
  * eventually live in, built now because browsing the data by hand is the
@@ -22,8 +22,8 @@
  * Created: 2026-09-16
  */
 
-#include "thestrongestpokemon_data.h"
-#include "thestrongestpokemon_battle.h"
+#include "pokesim_data.h"
+#include "pokesim_battle.h"
 
 #include <gtk/gtk.h>
 
@@ -977,7 +977,7 @@ static void activate(GtkApplication *app, gpointer data)
     sprites_init();
 
     GtkWidget *window = gtk_application_window_new(app);
-    gtk_window_set_title(GTK_WINDOW(window), "The Strongest Pokemon -- Pokedex");
+    gtk_window_set_title(GTK_WINDOW(window), "PokeSim");
     gtk_window_set_default_size(GTK_WINDOW(window), WINDOW_WIDTH, WINDOW_HEIGHT);
     gtk_widget_set_size_request(window, WINDOW_WIDTH, WINDOW_HEIGHT);
     gtk_window_set_resizable(GTK_WINDOW(window), FALSE);
@@ -2280,7 +2280,7 @@ int main(int argc, char *argv[])
         return run_tests(roster, count, chart) ? 0 : 1;
     }
     if (reporting) {
-        printf("thestrongestpokemon -- data layer\n");
+        printf("PokeSim -- data layer\n");
         report(roster, count, chart);
         return 0;
     }
@@ -2313,7 +2313,7 @@ int main(int argc, char *argv[])
     state.chart       = chart;
     state.type_filter = TYPE_NONE;
 
-    GtkApplication *app = gtk_application_new("com.ricky.thestrongestpokemon",
+    GtkApplication *app = gtk_application_new("com.ricky.pokesim",
                                               G_APPLICATION_DEFAULT_FLAGS);
     g_signal_connect(app, "activate", G_CALLBACK(activate), &state);
 

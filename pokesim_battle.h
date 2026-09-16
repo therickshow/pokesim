@@ -1,5 +1,5 @@
 /*
- * thestrongestpokemon_battle.h -- the battle simulator.
+ * pokesim_battle.h -- the battle simulator.
  *
  * One battle is two Pokemon, four moves each, alternating turns in speed
  * order until one faints or the turn cap is hit. Battles are random: damage
@@ -8,10 +8,10 @@
  * repeats. simulate_series() does exactly that.
  */
 
-#ifndef THESTRONGESTPOKEMON_BATTLE_H
-#define THESTRONGESTPOKEMON_BATTLE_H
+#ifndef POKESIM_BATTLE_H
+#define POKESIM_BATTLE_H
 
-#include "thestrongestpokemon_data.h"
+#include "pokesim_data.h"
 
 #define TEAM_MOVES   4          /* every Pokemon carries four moves        */
 #define TURN_CAP  1000          /* see the note on draws below             */
@@ -126,4 +126,4 @@ void run_tournament(const Pokemon *roster, int count,
                     int runs_per_pair, RankEntry *out,
                     volatile int *cancel, ProgressFn progress, void *user_data);
 
-#endif /* THESTRONGESTPOKEMON_BATTLE_H */
+#endif /* POKESIM_BATTLE_H */

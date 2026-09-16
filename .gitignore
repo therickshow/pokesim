@@ -1,5 +1,6 @@
 # ---- C build artifacts ----
 build/
+dist/
 bin/
 obj/
 *.o

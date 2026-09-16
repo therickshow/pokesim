@@ -1287,8 +1287,15 @@ static int run_tests(const Pokemon *roster, int count,
         battle_seed(7);
         simulate_series(&roster[10], &roster[13], chart, 20, &stall); /* Metapod v Kakuna */
         check(stall.battles == 20, "Metapod v Kakuna terminates instead of hanging");
-        check(stall.max_turns >= TURN_CAP,
-              "  and it is the turn cap that stops it");
+        /*
+         * Two Pokemon whose only move is Harden used to sit there until the
+         * turn cap and be called a draw. Now they burn through Harden's 30 PP
+         * and Struggle each other down, so the fight resolves on its own --
+         * which is why this asserts the cap is NOT what ends it.
+         */
+        check(stall.max_turns < TURN_CAP,
+              "  and it resolves through PP and Struggle, not the turn cap");
+        check(stall.draws == 0, "  with a real winner rather than a timeout");
     }
 
     /* Arceus should be a long way above a Magikarp. */

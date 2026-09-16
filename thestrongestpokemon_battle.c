@@ -298,6 +298,7 @@ typedef struct {
     int             sleep_turns;
     int             toxic_turns;
     int             moves[TEAM_MOVES];
+    int             pp[TEAM_MOVES];
     int             move_count;
     int             last_damage;        /* taken, for Counter and friends */
     MoveCategory    last_damage_cat;
@@ -335,11 +336,24 @@ static int eff_speed(const Battler *b)
 static void battler_init(Battler *b, const Pokemon *sp)
 {
     memset(b, 0, sizeof *b);
-    b->sp     = sp;
-    b->max_hp = sp->hp;
-    b->hp     = sp->hp;
+    b->sp = sp;
+    /* HP is the one stat that is not used as a ratio -- see HP_SCALE. */
+    b->max_hp = sp->hp * HP_SCALE;
+    b->hp     = b->max_hp;
     b->status = STATUS_NONE;
     choose_moveset(sp, b->moves, &b->move_count);
+
+    /*
+     * Power points are what stops a fight going forever. Without them a
+     * Pokemon carrying Recover or Moonlight heals half its bar every turn
+     * indefinitely and simply cannot be beaten by anything that does less
+     * than that per turn -- which made Toxic stalling a 98% strategy rather
+     * than a strong one. The counts come straight from moves.csv.
+     */
+    for (int i = 0; i < b->move_count; i++) {
+        int pp = move_table[b->moves[i]].pp;
+        b->pp[i] = (pp > 0) ? pp : 5;
+    }
 }
 
 /* ------------------------------------------------------------------ *
@@ -624,6 +638,9 @@ static int choose_move(Battler *user, Battler *target, int turn,
     int heal_slot = -1, setup_slot = -1, status_slot = -1;
 
     for (int i = 0; i < user->move_count; i++) {
+        if (user->pp[i] <= 0) {
+            continue;                       /* out of power points */
+        }
         const MoveData *mv = &move_table[user->moves[i]];
         SpecialMove kind = special_kind(mv->name);
 
@@ -685,8 +702,11 @@ static int choose_move(Battler *user, Battler *target, int turn,
         return best_slot;
     }
 
-    /* Nothing useful at all -- fall back to whatever is in slot 0. */
-    return (user->move_count > 0) ? 0 : -1;
+    /*
+     * Everything is out of PP (or there was nothing usable to begin with).
+     * -1 means Struggle, handled by the caller.
+     */
+    return -1;
 }
 
 /* ------------------------------------------------------------------ *
@@ -774,10 +794,42 @@ static int take_turn(Battler *user, Battler *target, int turn,
     }
 
     int slot = choose_move(user, target, turn, chart);
+
+    /*
+     * Out of PP entirely, so it Struggles: a typeless 50-power physical hit
+     * that also costs the user a quarter of the damage dealt. That is what
+     * ends a stalemate between two Pokemon that have run dry.
+     */
     if (slot < 0) {
-        return 0;
+        int attack  = eff_attack(user);
+        int defense = eff_defense(target);
+        if (defense < 1) {
+            defense = 1;
+        }
+        double base = ((2.0 * BATTLE_LEVEL / 5.0 + 2.0) * 50 * attack / defense)
+                      / 50.0 + 2.0;
+        base *= (85 + rng_below(16)) / 100.0;
+        int damage = (int)base;
+        if (damage < 1) {
+            damage = 1;
+        }
+        if (damage > target->hp) {
+            damage = target->hp;
+        }
+        target->hp -= damage;
+        target->last_damage     = damage;
+        target->last_damage_cat = CAT_PHYSICAL;
+
+        int recoil = damage / 4;
+        user->hp -= (recoil > 0) ? recoil : 1;
+        if (user->hp < 0) {
+            user->hp = 0;
+        }
+        return damage;
     }
+
     *slot_out = slot;
+    user->pp[slot]--;
 
     const MoveData *mv = &move_table[user->moves[slot]];
     SpecialMove kind = special_kind(mv->name);

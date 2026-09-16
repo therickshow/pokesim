@@ -35,9 +35,29 @@
  * the stat bars in the GUI so they are comparable between species. */
 #define MAX_SINGLE_STAT   255
 
+/* How a move deals its damage. Status moves deal none. */
+typedef enum { CAT_STATUS = 0, CAT_PHYSICAL, CAT_SPECIAL } MoveCategory;
+
+#define MAX_MOVE_TABLE 800      /* the roster refers to 708 distinct moves */
+
+/*
+ * One row of moves.csv. `power` of 0 on a damaging move means the power is
+ * computed at run time (Seismic Toss, Gyro Ball, Endeavor and 26 others);
+ * `accuracy` of 0 means the move cannot miss.
+ */
+typedef struct {
+    char         name[MOVE_NAME_LEN];
+    int          type;
+    MoveCategory category;
+    int          power;
+    int          accuracy;
+    int          pp;
+} MoveData;
+
 typedef struct {
     char name[MOVE_NAME_LEN];
     int  level;                 /* 0 means "learned on evolution" */
+    int  id;                    /* index into move_table, or -1 if unknown */
 } Move;
 
 typedef struct {
@@ -47,6 +67,7 @@ typedef struct {
     int  type2;                 /* index, or TYPE_NONE if single */
     int  hp, attack, defense, sp_atk, sp_def, speed;
     int  total;                 /* as stated in the file         */
+    int  weight_hg;             /* hectograms; Low Kick and friends need it */
     Move moves[MAX_MOVES];
     int  move_count;
 } Pokemon;
@@ -80,6 +101,24 @@ int load_type_chart(const char *path, double chart[TYPE_COUNT][TYPE_COUNT]);
  */
 double effectiveness(double chart[TYPE_COUNT][TYPE_COUNT],
                      int attack_type, const Pokemon *defender);
+
+extern MoveData move_table[MAX_MOVE_TABLE];
+extern int      move_table_count;
+
+/* Load moves.csv into move_table. 1 on success, 0 on failure. */
+int load_moves(const char *path);
+
+/* Load pokemon_weights.csv into roster[].weight_hg. */
+int load_weights(const char *path, Pokemon *roster, int count);
+
+/* Index into move_table for a move name, or -1 if it is not there. */
+int find_move(const char *name);
+
+/*
+ * Point every roster move at its move_table row. Returns the number that
+ * could not be resolved, which should be zero for the supplied data.
+ */
+int resolve_roster_moves(Pokemon *roster, int count);
 
 /*
  * Exposed only so the self-tests can reach it: this is the piece most likely

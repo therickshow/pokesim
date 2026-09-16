@@ -206,6 +206,7 @@ static int parse_moves(char *field, Pokemon *p, int line_no)
             Move *m = &p->moves[p->move_count++];
             snprintf(m->name, sizeof m->name, "%s", entry);
             m->level = level;
+            m->id    = -1;      /* resolved later by resolve_roster_moves() */
         }
 
         entry = (semicolon != NULL) ? semicolon + 1 : NULL;
@@ -467,4 +468,183 @@ double effectiveness(double chart[TYPE_COUNT][TYPE_COUNT],
         multiplier *= chart[attack_type][defender->type2];
     }
     return multiplier;
+}
+
+/* ------------------------------------------------------------------ *
+ * Move table
+ * ------------------------------------------------------------------ */
+
+MoveData move_table[MAX_MOVE_TABLE];
+int      move_table_count = 0;
+
+static MoveCategory category_from_name(const char *s)
+{
+    if (strcmp(s, "physical") == 0) {
+        return CAT_PHYSICAL;
+    }
+    if (strcmp(s, "special") == 0) {
+        return CAT_SPECIAL;
+    }
+    return CAT_STATUS;
+}
+
+int find_move(const char *name)
+{
+    for (int i = 0; i < move_table_count; i++) {
+        if (strcmp(move_table[i].name, name) == 0) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+int load_moves(const char *path)
+{
+    FILE *f = open_data(path);
+    if (f == NULL) {
+        fprintf(stderr, "Cannot open move file: %s\n", path);
+        return 0;
+    }
+    skip_bom(f);
+
+    char  line[LINE_LEN];
+    char *fields[6];
+    int   line_no = 0;
+
+    if (fgets(line, sizeof line, f) == NULL) {
+        fprintf(stderr, "%s is empty\n", path);
+        fclose(f);
+        return 0;
+    }
+    line_no++;
+    trim(line);
+    if (split_csv(line, fields, 6) != 6 || strcmp(fields[0], "Move") != 0) {
+        fprintf(stderr, "%s: unexpected header row\n", path);
+        fclose(f);
+        return 0;
+    }
+
+    move_table_count = 0;
+    while (fgets(line, sizeof line, f) != NULL) {
+        line_no++;
+        trim(line);
+        if (*line == 0) {
+            continue;
+        }
+        if (move_table_count >= MAX_MOVE_TABLE) {
+            fprintf(stderr, "line %d: more than %d moves -- raise MAX_MOVE_TABLE\n",
+                    line_no, MAX_MOVE_TABLE);
+            fclose(f);
+            return 0;
+        }
+        if (split_csv(line, fields, 6) != 6) {
+            fprintf(stderr, "line %d: expected 6 columns in %s\n", line_no, path);
+            fclose(f);
+            return 0;
+        }
+        for (int i = 0; i < 6; i++) {
+            trim(fields[i]);
+        }
+
+        MoveData *m = &move_table[move_table_count];
+        memset(m, 0, sizeof *m);
+
+        if (*fields[0] == 0 || strlen(fields[0]) >= MOVE_NAME_LEN) {
+            fprintf(stderr, "line %d: bad move name \"%s\"\n", line_no, fields[0]);
+            fclose(f);
+            return 0;
+        }
+        snprintf(m->name, sizeof m->name, "%s", fields[0]);
+
+        m->type = type_index(fields[1]);
+        if (m->type == TYPE_NONE) {
+            fprintf(stderr, "line %d: %s has unknown type \"%s\"\n",
+                    line_no, m->name, fields[1]);
+            fclose(f);
+            return 0;
+        }
+        m->category = category_from_name(fields[2]);
+
+        /* Power and accuracy may legitimately be blank: blank accuracy means
+         * the move never misses, and 0 power means it is worked out in the
+         * battle engine rather than read from the file. */
+        if (*fields[3] != 0 && !parse_int(fields[3], &m->power)) {
+            fprintf(stderr, "line %d: %s has bad power \"%s\"\n",
+                    line_no, m->name, fields[3]);
+            fclose(f);
+            return 0;
+        }
+        if (*fields[4] != 0 && !parse_int(fields[4], &m->accuracy)) {
+            fprintf(stderr, "line %d: %s has bad accuracy \"%s\"\n",
+                    line_no, m->name, fields[4]);
+            fclose(f);
+            return 0;
+        }
+        if (*fields[5] != 0 && !parse_int(fields[5], &m->pp)) {
+            m->pp = 0;
+        }
+
+        move_table_count++;
+    }
+
+    fclose(f);
+    return 1;
+}
+
+int load_weights(const char *path, Pokemon *roster, int count)
+{
+    FILE *f = open_data(path);
+    if (f == NULL) {
+        fprintf(stderr, "Cannot open weight file: %s\n", path);
+        return 0;
+    }
+    skip_bom(f);
+
+    char  line[LINE_LEN];
+    char *fields[2];
+
+    if (fgets(line, sizeof line, f) == NULL) {
+        fclose(f);
+        return 0;
+    }
+    trim(line);
+    if (split_csv(line, fields, 2) != 2 || strcmp(fields[0], "Dex") != 0) {
+        fprintf(stderr, "%s: unexpected header row\n", path);
+        fclose(f);
+        return 0;
+    }
+
+    while (fgets(line, sizeof line, f) != NULL) {
+        trim(line);
+        if (*line == 0) {
+            continue;
+        }
+        if (split_csv(line, fields, 2) != 2) {
+            continue;
+        }
+        trim(fields[0]);
+        trim(fields[1]);
+        int dex = 0, weight = 0;
+        if (parse_int(fields[0], &dex) && parse_int(fields[1], &weight) &&
+            dex >= 1 && dex <= count) {
+            roster[dex - 1].weight_hg = weight;
+        }
+    }
+
+    fclose(f);
+    return 1;
+}
+
+int resolve_roster_moves(Pokemon *roster, int count)
+{
+    int unresolved = 0;
+    for (int i = 0; i < count; i++) {
+        for (int m = 0; m < roster[i].move_count; m++) {
+            roster[i].moves[m].id = find_move(roster[i].moves[m].name);
+            if (roster[i].moves[m].id < 0) {
+                unresolved++;
+            }
+        }
+    }
+    return unresolved;
 }

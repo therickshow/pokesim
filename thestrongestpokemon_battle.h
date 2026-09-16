@@ -1,0 +1,86 @@
+/*
+ * thestrongestpokemon_battle.h -- the battle simulator.
+ *
+ * One battle is two Pokemon, four moves each, alternating turns in speed
+ * order until one faints or the turn cap is hit. Battles are random: damage
+ * rolls, critical hits, accuracy and status all use the RNG, so a single
+ * result means little and the interesting number is the win rate over many
+ * repeats. simulate_series() does exactly that.
+ */
+
+#ifndef THESTRONGESTPOKEMON_BATTLE_H
+#define THESTRONGESTPOKEMON_BATTLE_H
+
+#include "thestrongestpokemon_data.h"
+
+#define TEAM_MOVES   4          /* every Pokemon carries four moves        */
+#define TURN_CAP  1000          /* see the note on draws below             */
+
+/*
+ * The L in the damage formula.
+ *
+ * Ricky chose to use raw base stats rather than running them through the
+ * level/IV/EV formula. That makes HP small (45-255) while the damage formula
+ * at a normal level 50 would deal 80+ per hit, so every battle would end on
+ * turn one and Speed alone would decide the whole tournament.
+ *
+ * L is the one knob that fixes that without touching the base-stat decision:
+ * damage scales with (2L/5 + 2), so a small L brings damage back in line with
+ * raw HP. At 5 an average neutral hit takes off roughly an eighth of an
+ * average HP bar, giving battles of about 8-12 turns -- long enough for
+ * status, healing and setup to actually matter. Raise it for faster, swingier
+ * battles; lower it for longer ones.
+ */
+#define BATTLE_LEVEL 5
+
+typedef enum {
+    STATUS_NONE = 0,
+    STATUS_BURN,
+    STATUS_POISON,
+    STATUS_TOXIC,
+    STATUS_PARALYSIS,
+    STATUS_SLEEP,
+    STATUS_FREEZE
+} StatusCondition;
+
+typedef enum { RESULT_A_WINS = 0, RESULT_B_WINS, RESULT_DRAW } BattleResult;
+
+/* Everything worth reporting about a run of battles between two species. */
+typedef struct {
+    int       battles;
+    int       a_wins, b_wins, draws;
+    long long total_turns;
+    int       min_turns, max_turns;
+    long long a_damage, b_damage;       /* total dealt across all battles  */
+    int       a_crits, b_crits;
+    int       a_misses, b_misses;
+    int       a_move_used[TEAM_MOVES];  /* how often each move was chosen  */
+    int       b_move_used[TEAM_MOVES];
+    int       a_hp_left, b_hp_left;     /* summed over battles they won    */
+} SeriesStats;
+
+/* Seed the generator. Same seed plus same pairing gives the same results. */
+void battle_seed(unsigned int seed);
+
+/*
+ * The four moves a species fights with: the last four it learns, by level.
+ * Moves the engine cannot model (Fling and Natural Gift need held items,
+ * Bide and Spit Up need multi-turn state) are skipped. Species with fewer
+ * than four usable moves simply carry fewer.
+ */
+void choose_moveset(const Pokemon *p, int out[TEAM_MOVES], int *count);
+
+/* A single battle. `stats` may be NULL if only the winner matters. */
+BattleResult simulate_battle(const Pokemon *a, const Pokemon *b,
+                             double chart[TYPE_COUNT][TYPE_COUNT],
+                             SeriesStats *stats);
+
+/* Run `runs` battles and fill `out`. Zeroes `out` first. */
+void simulate_series(const Pokemon *a, const Pokemon *b,
+                     double chart[TYPE_COUNT][TYPE_COUNT],
+                     int runs, SeriesStats *out);
+
+/* Name of a move slot, for reporting. Returns "-" for an empty slot. */
+const char *moveset_name(const Pokemon *p, int slot);
+
+#endif /* THESTRONGESTPOKEMON_BATTLE_H */

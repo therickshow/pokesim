@@ -23,6 +23,7 @@
  */
 
 #include "thestrongestpokemon_data.h"
+#include "thestrongestpokemon_battle.h"
 
 #include <gtk/gtk.h>
 
@@ -948,6 +949,90 @@ static void report(const Pokemon *roster, int count,
 }
 
 /* ------------------------------------------------------------------ *
+ * Duel report (console)
+ * ------------------------------------------------------------------ */
+
+/* Case-insensitive species lookup, so --duel does not demand exact case. */
+static const Pokemon *find_species(const Pokemon *roster, int count,
+                                   const char *name)
+{
+    for (int i = 0; i < count; i++) {
+        const char *a = roster[i].name;
+        const char *b = name;
+        while (*a && *b &&
+               g_ascii_tolower((unsigned char)*a) == g_ascii_tolower((unsigned char)*b)) {
+            a++;
+            b++;
+        }
+        if (*a == '\0' && *b == '\0') {
+            return &roster[i];
+        }
+    }
+    return NULL;
+}
+
+static void print_moveset(const Pokemon *p)
+{
+    int moves[TEAM_MOVES], n = 0;
+    choose_moveset(p, moves, &n);
+    printf("    moves:");
+    for (int i = 0; i < n; i++) {
+        const MoveData *m = &move_table[moves[i]];
+        printf(" %s(%s %d)", m->name,
+               m->category == CAT_STATUS ? "sta"
+               : m->category == CAT_PHYSICAL ? "phy" : "spe",
+               m->power);
+    }
+    if (n == 0) {
+        printf(" none");
+    }
+    printf("\n");
+}
+
+static void report_duel(const Pokemon *a, const Pokemon *b,
+                        double chart[TYPE_COUNT][TYPE_COUNT], int runs)
+{
+    SeriesStats s;
+    simulate_series(a, b, chart, runs, &s);
+
+    printf("\n%s  vs  %s        %d battles\n", a->name, b->name, runs);
+    printf("--------------------------------------------------\n");
+    printf("  %-12s %s/%s  BST %d\n", a->name, type_name(a->type1),
+           a->type2 == TYPE_NONE ? "-" : type_name(a->type2), a->total);
+    print_moveset(a);
+    printf("  %-12s %s/%s  BST %d\n", b->name, type_name(b->type1),
+           b->type2 == TYPE_NONE ? "-" : type_name(b->type2), b->total);
+    print_moveset(b);
+
+    double pct_a = 100.0 * s.a_wins / (s.battles > 0 ? s.battles : 1);
+    double pct_b = 100.0 * s.b_wins / (s.battles > 0 ? s.battles : 1);
+    printf("\n  %-12s %5d wins  %5.1f%%\n", a->name, s.a_wins, pct_a);
+    printf("  %-12s %5d wins  %5.1f%%\n", b->name, s.b_wins, pct_b);
+    printf("  draws        %5d\n", s.draws);
+    printf("  turns        avg %.1f   min %d   max %d\n",
+           (double)s.total_turns / (s.battles > 0 ? s.battles : 1),
+           s.min_turns, s.max_turns);
+    printf("  damage dealt %s %lld, %s %lld\n",
+           a->name, s.a_damage, b->name, s.b_damage);
+    printf("  crits        %s %d, %s %d\n", a->name, s.a_crits, b->name, s.b_crits);
+    printf("  misses       %s %d, %s %d\n", a->name, s.a_misses, b->name, s.b_misses);
+
+    printf("  move usage   %s:", a->name);
+    for (int i = 0; i < TEAM_MOVES; i++) {
+        if (s.a_move_used[i] > 0) {
+            printf(" %s=%d", moveset_name(a, i), s.a_move_used[i]);
+        }
+    }
+    printf("\n               %s:", b->name);
+    for (int i = 0; i < TEAM_MOVES; i++) {
+        if (s.b_move_used[i] > 0) {
+            printf(" %s=%d", moveset_name(b, i), s.b_move_used[i]);
+        }
+    }
+    printf("\n");
+}
+
+/* ------------------------------------------------------------------ *
  * Self-tests
  * ------------------------------------------------------------------ */
 
@@ -1112,6 +1197,108 @@ static int run_tests(const Pokemon *roster, int count,
     }
     check(colours_ok, "all 18 type colours are present and well formed");
 
+    /* --- move table and the battle engine --- */
+    check(move_table_count == 708, "move table holds all 708 moves");
+    check(find_move("Flamethrower") >= 0, "Flamethrower is in the move table");
+    {
+        int fid = find_move("Flamethrower");
+        check(fid >= 0 && move_table[fid].power == 90 &&
+              move_table[fid].accuracy == 100 &&
+              move_table[fid].category == CAT_SPECIAL &&
+              move_table[fid].type == type_index("Fire"),
+              "  and is Fire, special, 90 power, 100 accuracy");
+        int hid = find_move("Harden");
+        check(hid >= 0 && move_table[hid].category == CAT_STATUS,
+              "Harden is a status move");
+        int tid = find_move("Tackle");
+        check(tid >= 0 && move_table[tid].power == 40 &&
+              move_table[tid].category == CAT_PHYSICAL,
+              "Tackle is physical with 40 power");
+    }
+
+    int unresolved_moves = 0;
+    for (int i = 0; i < count; i++) {
+        for (int m = 0; m < roster[i].move_count; m++) {
+            if (roster[i].moves[m].id < 0) {
+                unresolved_moves++;
+            }
+        }
+    }
+    check(unresolved_moves == 0, "every roster move resolves to the move table");
+
+    int weights_ok = 1;
+    for (int i = 0; i < count; i++) {
+        if (roster[i].weight_hg <= 0) {
+            weights_ok = 0;
+        }
+    }
+    check(weights_ok, "every species has a weight");
+    check(roster[142].weight_hg == 4600, "Snorlax weighs 460.0 kg");
+
+    /* Movesets */
+    {
+        int moves[TEAM_MOVES], n = 0;
+        choose_moveset(&roster[5], moves, &n);            /* Charizard */
+        check(n == TEAM_MOVES, "Charizard fights with four moves");
+        choose_moveset(&roster[10], moves, &n);           /* Metapod */
+        check(n == 1 && strcmp(move_table[moves[0]].name, "Harden") == 0,
+              "Metapod fights with its one move, Harden");
+    }
+
+    /* Determinism: the same seed must reproduce the same series exactly. */
+    {
+        SeriesStats s1, s2;
+        battle_seed(12345);
+        simulate_series(&roster[5], &roster[8], chart, 200, &s1);   /* Charizard v Blastoise */
+        battle_seed(12345);
+        simulate_series(&roster[5], &roster[8], chart, 200, &s2);
+        check(s1.a_wins == s2.a_wins && s1.b_wins == s2.b_wins &&
+              s1.total_turns == s2.total_turns,
+              "the same seed reproduces the same series");
+        check(s1.battles == 200, "a 200-battle series runs 200 battles");
+        check(s1.a_wins + s1.b_wins + s1.draws == 200,
+              "  and every battle has an outcome");
+    }
+
+    /* Type advantage has to actually show up in the results. */
+    {
+        SeriesStats water, fire;
+        battle_seed(99);
+        simulate_series(&roster[8], &roster[5], chart, 400, &water); /* Blastoise v Charizard */
+        check(water.a_wins > water.b_wins,
+              "Blastoise beats Charizard more often than not (Water v Fire/Flying)");
+
+        /*
+         * Win rate is the wrong thing to assert for a type advantage: a
+         * Toxic-and-recover staller can lose every damage race and still win
+         * the fight, which is exactly what Vileplume does to Charizard. What
+         * the type chart actually promises is that the super-effective side
+         * hits harder, so that is what gets checked.
+         */
+        battle_seed(99);
+        simulate_series(&roster[5], &roster[44], chart, 400, &fire); /* Charizard v Vileplume */
+        check(fire.a_damage > fire.b_damage * 3,
+              "Charizard out-damages Vileplume heavily (Fire into Grass/Poison)");
+    }
+
+    /* Two Pokemon that cannot hurt each other must terminate, not hang. */
+    {
+        SeriesStats stall;
+        battle_seed(7);
+        simulate_series(&roster[10], &roster[13], chart, 20, &stall); /* Metapod v Kakuna */
+        check(stall.battles == 20, "Metapod v Kakuna terminates instead of hanging");
+        check(stall.max_turns >= TURN_CAP,
+              "  and it is the turn cap that stops it");
+    }
+
+    /* Arceus should be a long way above a Magikarp. */
+    {
+        SeriesStats s;
+        battle_seed(4242);
+        simulate_series(&roster[492], &roster[128], chart, 200, &s); /* Arceus v Magikarp */
+        check(s.a_wins >= 195, "Arceus beats Magikarp essentially every time");
+    }
+
     printf("\n  %d checks, %d passed, %d failed\n",
            tests_run, tests_run - tests_failed, tests_failed);
     return tests_failed == 0;
@@ -1135,21 +1322,31 @@ int main(int argc, char *argv[])
 
     const char *roster_path = "pokemon_1025_stats_types_moves.csv";
     const char *chart_path  = "type_chart_18x18.csv";
+    const char *moves_path  = "moves.csv";
+    const char *weight_path = "pokemon_weights.csv";
     int         testing     = 0;
     int         reporting   = 0;
-    int         paths_given = 0;
+    int         duelling    = 0;
+    int         duel_runs   = 1000;
+    const char *duel_a      = NULL;
+    const char *duel_b      = NULL;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--test") == 0) {
             testing = 1;
         } else if (strcmp(argv[i], "--report") == 0) {
             reporting = 1;
-        } else if (paths_given == 0) {
-            roster_path = argv[i];
-            paths_given++;
-        } else {
-            chart_path = argv[i];
-            paths_given++;
+        } else if (strcmp(argv[i], "--duel") == 0) {
+            duelling = 1;
+        } else if (duelling && duel_a == NULL) {
+            duel_a = argv[i];
+        } else if (duelling && duel_b == NULL) {
+            duel_b = argv[i];
+        } else if (duelling) {
+            duel_runs = atoi(argv[i]);
+            if (duel_runs < 1) {
+                duel_runs = 1;
+            }
         }
     }
 
@@ -1169,6 +1366,19 @@ int main(int argc, char *argv[])
     if (!load_type_chart(chart_path, chart)) {
         return 1;
     }
+    if (!load_moves(moves_path)) {
+        return 1;
+    }
+    if (!load_weights(weight_path, roster, count)) {
+        return 1;
+    }
+
+    int unresolved = resolve_roster_moves(roster, count);
+    if (unresolved > 0) {
+        fprintf(stderr, "warning: %d roster moves are missing from %s\n",
+                unresolved, moves_path);
+    }
+    battle_seed(0x5eed1e);
 
     if (testing) {
         return run_tests(roster, count, chart) ? 0 : 1;
@@ -1176,6 +1386,24 @@ int main(int argc, char *argv[])
     if (reporting) {
         printf("thestrongestpokemon -- data layer\n");
         report(roster, count, chart);
+        return 0;
+    }
+    if (duelling) {
+        if (duel_a == NULL || duel_b == NULL) {
+            fprintf(stderr, "usage: --duel \"Name A\" \"Name B\" [runs]\n");
+            return 1;
+        }
+        const Pokemon *a = find_species(roster, count, duel_a);
+        const Pokemon *b = find_species(roster, count, duel_b);
+        if (a == NULL) {
+            fprintf(stderr, "No such Pokemon: %s\n", duel_a);
+            return 1;
+        }
+        if (b == NULL) {
+            fprintf(stderr, "No such Pokemon: %s\n", duel_b);
+            return 1;
+        }
+        report_duel(a, b, chart, duel_runs);
         return 0;
     }
 

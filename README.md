@@ -9,9 +9,9 @@ search, type filter, sortable columns, per-species stat bars, live type
 matchups computed from the chart, and the full chart on its own tab.
 
 ```powershell
-python "..\library\scriptsuild.py" --run   # open the window
-build	hestrongestpokemon.exe --report        # console summary
-build	hestrongestpokemon.exe --test          # 38 self-tests
+python "..\library\scripts\build.py" --run   # open the window
+build\thestrongestpokemon.exe --report        # console summary
+build\thestrongestpokemon.exe --test          # 38 self-tests
 ```
 
 The window is a fixed 16:10 (1200x750 logical px) and is deliberately not

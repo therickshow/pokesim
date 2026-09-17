@@ -1,17 +1,45 @@
 {
-    // The executable is always pokesim.exe, whichever source file you happen
-    // to have open -- the old ${fileBasenameNoExtension} would go looking for
-    // build\pokesim_data.exe if you were editing pokesim_data.c.
+    // Everything here is anchored to ${workspaceFolder}, so F5 works whichever
+    // file you happen to be looking at -- including this one.
+    //
+    // The previous version used ${fileDirname}\build\${fileBasenameNoExtension}.exe,
+    // which meant "the folder of the open file". With launch.json open that
+    // resolved to .vscode\build\launch.exe, which of course does not exist, and
+    // debugging simply failed. With pokesim_data.c open it would have gone
+    // looking for pokesim_data.exe. The executable is always pokesim.exe.
     "version": "0.2.0",
     "configurations": [
         {
-            "name": "Debug PokeSim",
+            "name": "Run PokeSim",
             "type": "cppdbg",
             "request": "launch",
-            "program": "${fileDirname}\\build\\pokesim.exe",
+            "program": "${workspaceFolder}\\build\\pokesim.exe",
             "args": [],
             "stopAtEntry": false,
-            "cwd": "${fileDirname}",
+            "cwd": "${workspaceFolder}",
+            "environment": [],
+            "externalConsole": false,
+            "MIMode": "gdb",
+            "miDebuggerPath": "C:\\msys64\\mingw64\\bin\\gdb.exe",
+            "setupCommands": [
+                {
+                    "description": "Enable pretty-printing for gdb",
+                    "text": "-enable-pretty-printing",
+                    "ignoreFailures": true
+                }
+            ],
+            "preLaunchTask": "Build PokeSim (debug)"
+        },
+        {
+            "name": "Run PokeSim self-tests",
+            "type": "cppdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}\\build\\pokesim.exe",
+            "args": [
+                "--test"
+            ],
+            "stopAtEntry": false,
+            "cwd": "${workspaceFolder}",
             "environment": [],
             "externalConsole": true,
             "MIMode": "gdb",
@@ -26,15 +54,18 @@
             "preLaunchTask": "Build PokeSim (debug)"
         },
         {
-            "name": "Debug PokeSim self-tests",
+            "name": "Run a duel (Charizard v Vileplume)",
             "type": "cppdbg",
             "request": "launch",
-            "program": "${fileDirname}\\build\\pokesim.exe",
+            "program": "${workspaceFolder}\\build\\pokesim.exe",
             "args": [
-                "--test"
+                "--duel",
+                "Charizard",
+                "Vileplume",
+                "1000"
             ],
             "stopAtEntry": false,
-            "cwd": "${fileDirname}",
+            "cwd": "${workspaceFolder}",
             "environment": [],
             "externalConsole": true,
             "MIMode": "gdb",

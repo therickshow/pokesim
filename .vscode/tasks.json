@@ -1,25 +1,26 @@
 {
-    // These call library/scripts/build.py rather than gcc directly.
+    // ${workspaceFolder}, never ${fileDirname}.
     //
-    // The old tasks compiled ${file} -- just the one file you had open -- with
-    // no pkg-config flags. That was fine when this project was a single .c
-    // file with no libraries. It is now three .c files that need GTK, so
-    // building the active file alone fails immediately on <gtk/gtk.h>, and
-    // would fail again at link time even if the header were found.
+    // ${fileDirname} is the folder of whatever file happens to be open, so
+    // pressing Ctrl+Shift+B while looking at launch.json tried to build
+    // .vscode\ -- a folder with no .c files in it -- and created an empty
+    // .vscode\build\ for its trouble. ${workspaceFolder} is this project, no
+    // matter which file has focus, so these work from anywhere.
     //
-    // build.py compiles every .c in the folder together and asks pkg-config
-    // for the GTK flags, so Ctrl+Shift+B does the same thing the README does.
+    // For that to be true, open THIS FOLDER in VS Code (or open
+    // Github-projz.code-workspace). Opening the bare "Github projz" folder
+    // makes VS Code use the .vscode at the root instead of this one.
     "version": "2.0.0",
     "tasks": [
         {
             "type": "shell",
             "label": "Build PokeSim (debug)",
-            "command": "${fileDirname}\\..\\library\\.venv\\bin\\python.exe",
+            "command": "${workspaceFolder}/../library/.venv/bin/python.exe",
             "args": [
-                "${fileDirname}\\..\\library\\scripts\\build.py"
+                "${workspaceFolder}/../library/scripts/build.py"
             ],
             "options": {
-                "cwd": "${fileDirname}"
+                "cwd": "${workspaceFolder}"
             },
             "problemMatcher": [
                 "$gcc"
@@ -28,55 +29,74 @@
                 "kind": "build",
                 "isDefault": true
             },
-            "detail": "All sources, warnings on, debug symbols. Output goes to build/."
+            "detail": "All three sources, warnings on, debug symbols. GTK handled automatically."
         },
         {
             "type": "shell",
             "label": "Build PokeSim (release)",
-            "command": "${fileDirname}\\..\\library\\.venv\\bin\\python.exe",
+            "command": "${workspaceFolder}/../library/.venv/bin/python.exe",
             "args": [
-                "${fileDirname}\\..\\library\\scripts\\build.py",
+                "${workspaceFolder}/../library/scripts/build.py",
                 "--release"
             ],
             "options": {
-                "cwd": "${fileDirname}"
+                "cwd": "${workspaceFolder}"
             },
             "problemMatcher": [
                 "$gcc"
             ],
             "group": "build",
-            "detail": "Optimised. The tournament runs about three times faster."
+            "detail": "Optimised, and no console window. The tournament runs about three times faster."
         },
         {
             "type": "shell",
-            "label": "Build and run PokeSim",
-            "command": "${fileDirname}\\..\\library\\.venv\\bin\\python.exe",
+            "label": "Run PokeSim",
+            "command": "${workspaceFolder}/../library/.venv/bin/python.exe",
             "args": [
-                "${fileDirname}\\..\\library\\scripts\\build.py",
+                "${workspaceFolder}/../library/scripts/build.py",
                 "--run"
             ],
             "options": {
-                "cwd": "${fileDirname}"
+                "cwd": "${workspaceFolder}"
             },
             "problemMatcher": [
                 "$gcc"
             ],
             "group": "build",
-            "detail": "Builds, then opens the window."
+            "detail": "Builds, then opens the window. The simplest way to just run it."
         },
         {
             "type": "shell",
             "label": "Run PokeSim self-tests",
-            "command": "${fileDirname}\\build\\pokesim.exe",
+            "command": "${workspaceFolder}/build/pokesim.exe",
             "args": [
                 "--test"
             ],
             "options": {
-                "cwd": "${fileDirname}"
+                "cwd": "${workspaceFolder}"
+            },
+            "dependsOn": "Build PokeSim (debug)",
+            "problemMatcher": [],
+            "group": {
+                "kind": "test",
+                "isDefault": true
+            },
+            "detail": "57 checks over the data, the loaders and the battle engine."
+        },
+        {
+            "type": "shell",
+            "label": "Package PokeSim for distribution",
+            "command": "${workspaceFolder}/../library/.venv/bin/python.exe",
+            "args": [
+                "${workspaceFolder}/../library/scripts/package.py",
+                "--zip"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}"
             },
             "problemMatcher": [],
-            "group": "test",
-            "detail": "57 checks over the data, the loaders and the battle engine."
+            "group": "build",
+            "detail": "Bundles it with the whole GTK runtime into dist/, and zips it."
         }
     ]
 }

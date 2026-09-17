@@ -36,15 +36,41 @@
  * fixed-damage moves: Seismic Toss and Night Shade deal damage equal to L, so
  * at L=5 they were doing 5 damage and were effectively dead moves.
  *
- * 14 was chosen by measurement, not taste. Sweeping the value and timing
- * battles gives 4.6 turns at 8, 7.0 at 12, 8.3 at 14, 10.1 at 16 and 14.4 at
- * 20, scaling cleanly with no runaway tail now that PP and Struggle end
- * stalemates. 14 puts the average fight at about eight turns and the longest
- * at under twenty -- enough room for Toxic to ramp, for a setup move to pay
- * for itself and for healing to matter, without the whole tournament
- * slowing down. */
+ * The value matters far more than it looks, and for a reason that is easy to
+ * miss: damage does not depend on HP at all -- it comes out of Attack,
+ * Defence, move power and level -- but HEALING is a percentage of HP, and so
+ * are Toxic, Super Fang and Endeavor. Raising HP_SCALE therefore makes every
+ * heal and every percentage effect stronger relative to every attack, while
+ * leaving attacks exactly where they were.
+ *
+ * This was originally 14, chosen to make battles last about eight turns
+ * because long fights seemed more interesting. That was the wrong thing to
+ * optimise. At 14 a Vileplume with Moonlight could out-heal a Charizard
+ * hitting it for double damage and won 100% of the time, which is nonsense in
+ * any Pokemon game ever made.
+ *
+ * So it is now chosen by correctness instead, scored against a dozen matchups
+ * whose answer is not in doubt -- Fire into Grass, Electric into Water/Flying,
+ * Ice into Dragon. Charizard beats Vileplume 100% of the time at 4, but only
+ * 32% at 9 and 0% at 14:
+ *
+ *      HP_SCALE      2      3      4      6      9     14
+ *      correct   12/12  12/12  12/12  12/12   9/12   8/12
+ *      turns       1.5    2.3    2.9    5.8   11.1   19.1
+ *
+ * 4 scores full marks and gives roughly three-turn battles, which is about
+ * what a real one-on-one lasts. Going higher buys longer fights at the cost of
+ * handing the win to whoever can heal.
+ *
+ * Two matchups were cut from that list as bad tests rather than bad results.
+ * Pikachu against Gyarados is not the walkover a 4x advantage suggests: at
+ * level 50 Gyarados does 109% of Pikachu's HP bar while Pikachu's Thunderbolt
+ * does 82% of Gyarados's, so Gyarados genuinely wins. And Weavile's only
+ * level-up Ice move is Ice Shard at 40 power, so it cannot express its 4x
+ * advantage at all -- a limit of the learnset, not of the simulator.
+ */
 #define BATTLE_LEVEL 50
-#define HP_SCALE     14
+#define HP_SCALE      4
 
 typedef enum {
     STATUS_NONE = 0,

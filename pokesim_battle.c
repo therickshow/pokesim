@@ -487,6 +487,16 @@ static void choose_moveset_uncached(const Pokemon *p, int out[TEAM_MOVES],
         }
         value = value * ((m->accuracy > 0) ? m->accuracy : 100) / 100;
 
+        /*
+         * Weight by the stat the move will actually be fired from. Power on
+         * its own is not worth the same to everybody: Weavile has 120 Attack
+         * and 45 Sp. Atk, so an 80-power special move does less for it than a
+         * 40-power physical one. Scoring on power alone handed it Dark Pulse
+         * and Icy Wind -- two special moves -- and left its Attack unused.
+         */
+        int offence = (m->category == CAT_PHYSICAL) ? p->attack : p->sp_atk;
+        value = value * offence / 100;
+
         cands[cand_count].id    = id;
         cands[cand_count].type  = m->type;
         cands[cand_count].value = value;
